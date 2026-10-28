@@ -1,0 +1,480 @@
+"""SQLite 存储层：项目注册表（platform.db）+ 每项目独立库（projects/ws-<id>.db）。
+
+- RegistryStore：仅 workspace 表，记录项目元数据。
+- ProjectStore：单个项目的角色/场景/规格/导入报告，一个项目一个文件。
+- PlatformStore：组合两者，对 API 层提供统一入口。
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+
+# 场景生命周期状态（四态）。内容/规格被修改时自动回退到「草稿」；「已开发」由开发工具成功后设置；「已验证」仅手动。
+SCENARIO_STATUSES = ["草稿", "已确认", "已开发", "已验证"]
+_EDITABLE_RESET = {"已确认", "已开发", "已验证"}  # 这些状态下改内容 → 自动回退草稿
+
+REGISTRY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workspace (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    source_path TEXT DEFAULT '',
+    created_at REAL NOT NULL
+);
+"""
+
+# 注册表列级迁移（已有库补列）
+REGISTRY_MIGRATIONS = [
+    "ALTER TABLE workspace ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'",  # 项目级设置，如 system_label
+]
+
+PROJECT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS role (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    abbr TEXT DEFAULT '',
+    core_work TEXT DEFAULT '',
+    permissions TEXT DEFAULT '',
+    sort INTEGER DEFAULT 0,
+    UNIQUE(name)
+);
+CREATE TABLE IF NOT EXISTS scenario (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL,
+    title TEXT NOT NULL,
+    domain TEXT DEFAULT '',
+    data TEXT NOT NULL DEFAULT '{}',   -- Scenario 序列化 JSON
+    pending TEXT NOT NULL DEFAULT '[]', -- 关联的待确认/待办条目 JSON
+    origin TEXT NOT NULL DEFAULT 'import',
+    edited INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(code)
+);
+CREATE TABLE IF NOT EXISTS import_report (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    warnings TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS ui_spec (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scenario_code TEXT NOT NULL,
+    spec TEXT NOT NULL DEFAULT '{}',
+    updated_at REAL NOT NULL,
+    UNIQUE(scenario_code)
+);
+CREATE TABLE IF NOT EXISTS process_spec (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scenario_code TEXT NOT NULL,
+    spec TEXT NOT NULL DEFAULT '{}',
+    updated_at REAL NOT NULL,
+    UNIQUE(scenario_code)
+);
+CREATE TABLE IF NOT EXISTS chat_message (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT DEFAULT '',
+    role TEXT NOT NULL,          -- user | assistant
+    content TEXT NOT NULL,       -- 用户文本 / AI 回复原文（含 ```change 块）
+    selection TEXT DEFAULT '',
+    image TEXT DEFAULT '',       -- 截图 dataURL
+    changes TEXT DEFAULT '[]',   -- parse_changes 拆出的指令 JSON（仅 assistant 行有）
+    created_at REAL NOT NULL
+);
+"""
+
+# 项目库列级迁移（已有库补列）
+PROJECT_MIGRATIONS = [
+    "ALTER TABLE chat_message ADD COLUMN had_invalid INTEGER NOT NULL DEFAULT 0",  # assistant 回复是否含解析失败的 change
+    "ALTER TABLE scenario ADD COLUMN status TEXT NOT NULL DEFAULT '草稿'",  # 草稿/已确认/已开发/已验证
+    "ALTER TABLE scenario ADD COLUMN version TEXT NOT NULL DEFAULT ''",     # 归属的工具发布版本，如 v0.1.0
+]
+
+
+def _connect(db_path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _open(db_path: str | Path):
+    """连接上下文：提交并真正关闭（with sqlite3.connect 只提交不关闭）。"""
+    conn = _connect(db_path)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class RegistryStore:
+    """项目注册表：platform.db，仅存 workspace 表。"""
+
+    def __init__(self, db_path: str | Path):
+        self.db_path = str(db_path)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        with _open(self.db_path) as c:
+            c.executescript(REGISTRY_SCHEMA)
+            for sql in REGISTRY_MIGRATIONS:
+                try:
+                    c.execute(sql)
+                except Exception:
+                    pass  # 列已存在
+
+    def list_workspaces(self) -> list[dict]:
+        with _open(self.db_path) as c:
+            rows = c.execute("SELECT * FROM workspace ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_workspace(self, ws_id: int) -> dict | None:
+        with _open(self.db_path) as c:
+            row = c.execute("SELECT * FROM workspace WHERE id = ?", (ws_id,)).fetchone()
+        return dict(row) if row else None
+
+    def create_workspace(self, name: str, description: str = "", source_path: str = "") -> int:
+        with _open(self.db_path) as c:
+            cur = c.execute(
+                "INSERT INTO workspace(name, description, source_path, created_at) VALUES (?,?,?,?)",
+                (name, description, source_path, time.time()),
+            )
+            return cur.lastrowid
+
+    def delete_workspace(self, ws_id: int) -> None:
+        with _open(self.db_path) as c:
+            c.execute("DELETE FROM workspace WHERE id = ?", (ws_id,))
+
+    def update_workspace_settings(self, ws_id: int, patch: dict) -> dict:
+        """合并写入 workspace.settings（JSON），返回合并后的完整 settings。"""
+        import json as _json
+        with _open(self.db_path) as c:
+            row = c.execute("SELECT settings FROM workspace WHERE id = ?", (ws_id,)).fetchone()
+            if not row:
+                return {}
+            cur = _json.loads(row["settings"] or "{}")
+            cur.update(patch)
+            c.execute("UPDATE workspace SET settings = ? WHERE id = ?", (_json.dumps(cur, ensure_ascii=False), ws_id))
+        return cur
+
+
+class ProjectStore:
+    """单个项目的数据库：角色/场景/界面规格/过程拆解/导入报告。"""
+
+    def __init__(self, db_path: str | Path):
+        self.db_path = str(db_path)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        with _open(self.db_path) as c:
+            c.executescript(PROJECT_SCHEMA)
+            for sql in PROJECT_MIGRATIONS:
+                try:
+                    c.execute(sql)
+                except Exception:
+                    pass  # 列已存在
+
+    def _conn(self):
+        return _open(self.db_path)
+
+    def close(self) -> None:
+        """Windows 下删文件前必须确保无句柄占用；连接都是 with 短连接，这里仅做 GC 兜底。"""
+        import gc
+        gc.collect()
+
+    # ---------------------------------------------------------- 角色
+    def create_role(self, name: str, abbr: str = "", core_work: str = "", permissions: str = "") -> int:
+        with self._conn() as c:
+            row = c.execute("SELECT COALESCE(MAX(sort), -1) + 1 AS s FROM role").fetchone()
+            cur = c.execute(
+                "INSERT INTO role(name, abbr, core_work, permissions, sort) VALUES (?,?,?,?,?)",
+                (name, abbr, core_work, permissions, row["s"]),
+            )
+            return cur.lastrowid
+
+    def update_role(self, role_id: int, fields: dict) -> None:
+        cols = [k for k in ("name", "abbr", "core_work", "permissions") if k in fields]
+        if not cols:
+            return
+        sql = "UPDATE role SET " + ", ".join(f"{k} = ?" for k in cols) + " WHERE id = ?"
+        with self._conn() as c:
+            c.execute(sql, [*(fields[k] for k in cols), role_id])
+
+    def delete_role(self, role_id: int) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM role WHERE id = ?", (role_id,))
+
+    def list_roles(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM role ORDER BY sort, id").fetchall()
+        return [dict(r) for r in rows]
+
+    def role_names(self) -> set[str]:
+        with self._conn() as c:
+            return {r["name"] for r in c.execute("SELECT name FROM role").fetchall()}
+
+    # ---------------------------------------------------------- 导入
+    def import_document(self, doc: dict, pending_by_scenario: dict[str, list], warnings: list[dict]) -> None:
+        """重导：清空未编辑的导入场景后写入；平台编辑过/手工创建的场景保留并记告警。"""
+        with self._conn() as c:
+            existing = {r["name"] for r in c.execute("SELECT name FROM role").fetchall()}
+            c.execute("DELETE FROM scenario WHERE origin = 'import' AND edited = 0")
+            kept = {r["code"] for r in c.execute("SELECT code FROM scenario").fetchall()}
+            next_sort = c.execute("SELECT COALESCE(MAX(sort), -1) + 1 AS s FROM role").fetchone()["s"]
+            for r in doc["roles"]:
+                if r["name"] in existing:
+                    continue  # 已有角色：视为平台定义，保留用户编辑
+                c.execute(
+                    "INSERT INTO role(name, abbr, core_work, permissions, sort) VALUES (?,?,?,?,?)",
+                    (r["name"], r.get("abbr", ""), r.get("core_work", ""), r.get("permissions", ""), next_sort),
+                )
+                next_sort += 1
+            for sc in doc["scenarios"]:
+                if sc["code"] in kept:
+                    warnings.append({"scenario": sc["code"], "step": "-", "reason": "场景已在平台编辑或为手工创建，导入已跳过（保留平台版本）", "action": ""})
+                    continue
+                c.execute(
+                    "INSERT INTO scenario(code, title, domain, data, pending, origin, edited) VALUES (?,?,?,?,?,'import',0)",
+                    (
+                        sc["code"],
+                        sc["title"],
+                        sc.get("domain", ""),
+                        json.dumps(sc, ensure_ascii=False),
+                        json.dumps(pending_by_scenario.get(sc["code"], []), ensure_ascii=False),
+                    ),
+                )
+            c.execute(
+                "INSERT INTO import_report(created_at, warnings) VALUES (?,?)",
+                (time.time(), json.dumps(warnings, ensure_ascii=False)),
+            )
+
+    # ---------------------------------------------------------- 场景编辑
+    def update_scenario(self, code: str, title: str, domain: str, data: dict, pending: list) -> None:
+        """更新场景内容。内容变更时，若当前状态是 已确认/已开发/已验证，自动回退为「草稿」。"""
+        with self._conn() as c:
+            cur = c.execute("SELECT status FROM scenario WHERE code = ?", (code,)).fetchone()
+            status = cur["status"] if cur else "草稿"
+            if status in _EDITABLE_RESET:
+                status = "草稿"
+            c.execute(
+                "UPDATE scenario SET title = ?, domain = ?, data = ?, pending = ?, edited = 1, status = ? WHERE code = ?",
+                (title, domain, json.dumps(data, ensure_ascii=False), json.dumps(pending, ensure_ascii=False), status, code),
+            )
+
+    def set_scenario_status(self, code: str, status: str = None, version: str = None) -> None:
+        """设置场景状态/版本（None 表示不动该字段）。"""
+        sets, vals = [], []
+        if status is not None:
+            if status not in SCENARIO_STATUSES:
+                raise ValueError(f"非法状态：{status}")
+            sets.append("status = ?"); vals.append(status)
+        if version is not None:
+            sets.append("version = ?"); vals.append(version)
+        if not sets:
+            return
+        vals.append(code)
+        with self._conn() as c:
+            c.execute(f"UPDATE scenario SET {', '.join(sets)} WHERE code = ?", vals)
+
+    def mark_scenarios_developed(self, codes: list[str], version: str = "") -> None:
+        """开发工具成功后：把场景标为「已开发」，可选记录所属工具版本。"""
+        with self._conn() as c:
+            for code in codes:
+                if version:
+                    c.execute("UPDATE scenario SET status = '已开发', version = ? WHERE code = ?", (version, code))
+                else:
+                    c.execute("UPDATE scenario SET status = '已开发' WHERE code = ?", (code,))
+
+    def create_scenario(self, code: str, title: str, domain: str, data: dict, pending: list) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO scenario(code, title, domain, data, pending, origin, edited) VALUES (?,?,?,?,?,'manual',1)",
+                (code, title, domain, json.dumps(data, ensure_ascii=False), json.dumps(pending, ensure_ascii=False)),
+            )
+
+    def delete_scenario(self, code: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM scenario WHERE code = ?", (code,))
+
+    # ---------------------------------------------------------- 查询
+    def list_scenarios(self) -> list[dict]:
+        """场景树用的轻量列表（附步骤/变体/待办计数，不含 data 正文）。"""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, code, title, domain, data, pending, origin, edited, status, version FROM scenario ORDER BY CAST(code AS REAL), code"
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = {"id": r["id"], "code": r["code"], "title": r["title"], "domain": r["domain"], "origin": r["origin"], "edited": r["edited"],
+                 "status": r["status"], "version": r["version"]}
+            data = json.loads(r["data"])
+            d["step_count"] = len(data.get("steps", []))
+            d["variant_count"] = len(data.get("variants", []))
+            d["pending_count"] = len(json.loads(r["pending"]))
+            out.append(d)
+        return out
+
+    def scenario_count(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) AS n FROM scenario").fetchone()["n"]
+
+    def role_count(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) AS n FROM role").fetchone()["n"]
+
+    def get_scenario(self, code: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM scenario WHERE code = ?", (code,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["data"] = json.loads(d["data"])
+        d["pending"] = json.loads(d["pending"])
+        return d
+
+    def get_latest_warnings(self) -> list[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT warnings FROM import_report ORDER BY id DESC LIMIT 1").fetchone()
+        return json.loads(row["warnings"]) if row else []
+
+    # ---------------------------------------------------------- 界面规格
+    def get_ui_spec(self, code: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT spec, updated_at FROM ui_spec WHERE scenario_code = ?", (code,)
+            ).fetchone()
+        if not row:
+            return None
+        return {"spec": json.loads(row["spec"]), "updated_at": row["updated_at"]}
+
+    def save_ui_spec(self, code: str, spec: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO ui_spec(scenario_code, spec, updated_at) VALUES (?,?,?)
+                   ON CONFLICT(scenario_code) DO UPDATE SET spec = excluded.spec, updated_at = excluded.updated_at""",
+                (code, json.dumps(spec, ensure_ascii=False), time.time()),
+            )
+            # 原型规格变更也算内容变更：已确认/已开发/已验证 → 回退草稿
+            cur = c.execute("SELECT status FROM scenario WHERE code = ?", (code,)).fetchone()
+            if cur and cur["status"] in _EDITABLE_RESET:
+                c.execute("UPDATE scenario SET status = '草稿' WHERE code = ?", (code,))
+
+    # ---------------------------------------------------------- 过程拆解规格
+    def get_process_spec(self, code: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT spec, updated_at FROM process_spec WHERE scenario_code = ?", (code,)
+            ).fetchone()
+        if not row:
+            return None
+        return {"spec": json.loads(row["spec"]), "updated_at": row["updated_at"]}
+
+    def save_process_spec(self, code: str, spec: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO process_spec(scenario_code, spec, updated_at) VALUES (?,?,?)
+                   ON CONFLICT(scenario_code) DO UPDATE SET spec = excluded.spec, updated_at = excluded.updated_at""",
+                (code, json.dumps(spec, ensure_ascii=False), time.time()),
+            )
+    # ---------------------------------------------------------- 聊天历史
+    def save_chat_message(self, session_id: str, role: str, content: str,
+                          selection: str = "", image: str = "", changes: list | None = None,
+                          had_invalid: bool = False) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO chat_message(session_id, role, content, selection, image, changes, had_invalid, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (session_id, role, content, selection, image,
+                 json.dumps(changes or [], ensure_ascii=False), 1 if had_invalid else 0, time.time()),
+            )
+
+    def last_invalid_change_summary(self) -> str | None:
+        """最近一条含解析失败 change 的 assistant 回复的错误摘要（用于下一轮自动提醒 AI 重发）。无则 None。"""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT changes FROM chat_message WHERE role = 'assistant' AND had_invalid = 1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            for ch in json.loads(row["changes"]):
+                if ch.get("_invalid"):
+                    return ch.get("summary", "")
+        except Exception:
+            pass
+        return None
+
+    def list_chat_messages(self, limit: int = 200) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT session_id, role, content, selection, image, changes, created_at FROM chat_message ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        out = []
+        for r in reversed(rows):
+            d = dict(r)
+            d["changes"] = json.loads(d["changes"])
+            out.append(d)
+        return out
+
+    def clear_chat_messages(self) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM chat_message")
+
+
+class PlatformStore:
+    """对 API 层的统一入口：注册表 + 按项目 lazy-load 的项目库。"""
+
+    def __init__(self, data_dir: str | Path):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.projects_dir = self.data_dir / "projects"
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
+        self.registry = RegistryStore(self.data_dir / "platform.db")
+        self._projects: dict[int, ProjectStore] = {}
+
+    def project_db_path(self, ws_id: int) -> Path:
+        return self.projects_dir / f"ws-{ws_id}.db"
+
+    def project(self, ws_id: int) -> ProjectStore:
+        """按 ws_id 取项目库（不存在文件时创建空库；调用方需先确认项目已注册）。"""
+        if ws_id not in self._projects:
+            if not self.registry.get_workspace(ws_id):
+                raise KeyError(f"工作域 {ws_id} 不存在")
+            self._projects[ws_id] = ProjectStore(self.project_db_path(ws_id))
+        return self._projects[ws_id]
+
+    # ---------------------------------------------------------- 工作域（组合注册表与项目库统计）
+    def list_workspaces(self) -> list[dict]:
+        out = []
+        for w in self.registry.list_workspaces():
+            path = self.project_db_path(w["id"])
+            if path.exists():
+                p = self.project(w["id"])
+                w["scenario_count"] = p.scenario_count()
+                w["role_count"] = p.role_count()
+            else:
+                w["scenario_count"] = 0
+                w["role_count"] = 0
+            out.append(w)
+        return out
+
+    def get_workspace(self, ws_id: int) -> dict | None:
+        return self.registry.get_workspace(ws_id)
+
+    def update_workspace_settings(self, ws_id: int, patch: dict) -> dict:
+        return self.registry.update_workspace_settings(ws_id, patch)
+
+    def create_workspace(self, name: str, description: str = "", source_path: str = "") -> int:
+        ws_id = self.registry.create_workspace(name, description, source_path)
+        ProjectStore(self.project_db_path(ws_id))  # 立即建库
+        return ws_id
+
+    def delete_workspace(self, ws_id: int) -> None:
+        self.registry.delete_workspace(ws_id)
+        proj = self._projects.pop(ws_id, None)
+        if proj is not None:
+            proj.close()
+        path = self.project_db_path(ws_id)
+        if path.exists():
+            path.unlink()

@@ -1,0 +1,193 @@
+{
+  "kind": "process",
+  "version": 2,
+  "title": "新建软件类型仓库 — 过程拆解",
+  "desc": "stepDetails 按主流程步骤号键控；每步 actors 数组按对象分块：name=对象名（人=场景角色，其余为系统/服务），kind=system 标记系统侧；items 为该对象的动作序列，kind ∈ call(调用)/read(获取)/write(存储)/show(展示)/act(动作)。",
+  "stepDetails": {
+    "1": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "在 VS Code 中执行「新建软件类型仓库」命令" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "call", "text": "Polarion REST API：查询当前用户有权限的项目空间" },
+          { "kind": "read", "text": "Polarion 用户身份与项目权限" },
+          { "kind": "show", "text": "项目空间列表（下拉 + 搜索）" }
+        ]}
+      ]
+    },
+    "2": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "在项目空间列表中选择 MCU2441G4MBB" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "call", "text": "GPULSE Configuration：按项目编号前三位映射 P1，按完整项目编号映射 P3" },
+          { "kind": "call", "text": "MCU 平台管理空间：映射 P2（读不到默认 00）；读取以项目编号命名工作项的 Base Platform 属性" },
+          { "kind": "read", "text": "G-C047 固定映射表" },
+          { "kind": "read", "text": "Base Platform 属性（判断平台项目复用，决定 P6 填充）" },
+          { "kind": "write", "text": "本地表单状态：P1/P2/P3/P6/P7 默认值" },
+          { "kind": "show", "text": "P1/P2/P3 只读字段、P6/P7 默认值、已有软件类型仓库列表" }
+        ]}
+      ]
+    },
+    "3": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "选择 P4 软件类型（默认 P，可修改）" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "G-C047 软件类型候选集" },
+          { "kind": "show", "text": "P4 下拉列表（默认 P）" }
+        ]}
+      ]
+    },
+    "4": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "选择 P5 部件类型、P6 客户信息/平台小版本" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "P6 填充规则（客户项目 ZZ / 平台项目 00 / 复用按关联平台版本）" },
+          { "kind": "call", "text": "GitLab API：校验生成的仓库名是否与已有仓库冲突" },
+          { "kind": "write", "text": "本地表单状态：P5、P6、仓库名" },
+          { "kind": "show", "text": "仓库名实时预览 <项目编号>_<P6>_<P5><P4>；冲突时提示" }
+        ]}
+      ]
+    },
+    "5": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "确认/修改初始 P7 平台/硬件版本和 P8 软件版本" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "P8 格式规则（3 位、不含 I/O）" },
+          { "kind": "write", "text": "本地表单状态：P7、P8" },
+          { "kind": "show", "text": "P7/P8 输入框（默认 A0 / 100）；P8 格式错误高亮" }
+        ]}
+      ]
+    },
+    "6": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "选择编译器及版本" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "可选编译器清单（Tasking、HighTec 及版本）" },
+          { "kind": "write", "text": "本地配置：编译器及版本记录" },
+          { "kind": "show", "text": "编译器及版本下拉列表" }
+        ]}
+      ]
+    },
+    "7": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "选择项目初始模板" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "call", "text": "模板仓库：可访问性检查" },
+          { "kind": "read", "text": "模板清单（当前仅默认模板）" },
+          { "kind": "write", "text": "本地表单状态：模板选择" },
+          { "kind": "show", "text": "模板选择列表；不可访问时提示（允许重试/跳过）" }
+        ]}
+      ]
+    },
+    "8": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "确认创建" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "全部表单值（P1-P8、编译器、模板）" },
+          { "kind": "write", "text": "第一版集成登记表（模块列表为空）" },
+          { "kind": "show", "text": "最终确认对话框：仓库名、P8、编译器版本、模板来源" }
+        ]}
+      ]
+    },
+    "9": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "点击确认" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "仓库名、GitLab 访问凭证" },
+          { "kind": "call", "text": "GitLab API：在 G4_Projects/MCU/MCU2441G4MBB 分组下创建远端仓库" },
+          { "kind": "write", "text": "GitLab 远端仓库（空仓库）" },
+          { "kind": "show", "text": "创建进度通知：创建仓库阶段" }
+        ]}
+      ]
+    },
+    "10": {
+      "actors": [
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "call", "text": "Polarion REST API：读取项目空间成员与角色" },
+          { "kind": "read", "text": "项目软件集成工程师列表、软件开发工程师列表" },
+          { "kind": "call", "text": "GitLab API：设置仓库成员权限（集成工程师 Maintainer / 开发工程师 Developer）" },
+          { "kind": "write", "text": "仓库成员权限配置" },
+          { "kind": "show", "text": "创建进度通知：配置权限阶段" }
+        ]}
+      ]
+    },
+    "11": {
+      "actors": [
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "call", "text": "GitLab API：读取模板仓库内容" },
+          { "kind": "read", "text": "项目初始模板（目录结构、基础配置文件、工程说明文件）" },
+          { "kind": "call", "text": "GitLab API：写入新仓库" },
+          { "kind": "write", "text": "新仓库初始框架文件" },
+          { "kind": "show", "text": "创建进度通知：复制模板阶段" }
+        ]}
+      ]
+    },
+    "12": {
+      "actors": [
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "用户选择的编译器及版本" },
+          { "kind": "write", "text": "Gp_Build.xml" },
+          { "kind": "show", "text": "创建进度通知：生成 Gp_Build.xml 阶段" }
+        ]}
+      ]
+    },
+    "13": {
+      "actors": [
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "第一版集成登记表（步骤 8 生成）" },
+          { "kind": "write", "text": "integration.yaml（模块列表为空）" },
+          { "kind": "show", "text": "创建进度通知：生成 integration.yaml 阶段" }
+        ]}
+      ]
+    },
+    "14": {
+      "actors": [
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "初始 P8（默认 100）、完整软件名 P1-P8" },
+          { "kind": "call", "text": "GitLab API：创建分支" },
+          { "kind": "write", "text": "远端分支：main、dev、feature/<完整软件名 P1-P8>" },
+          { "kind": "show", "text": "创建进度通知：创建分支阶段" }
+        ]}
+      ]
+    },
+    "15": {
+      "actors": [
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "模板框架文件、Gp_Build.xml、integration.yaml" },
+          { "kind": "call", "text": "GitLab API：提交并推送文件到 feature 分支" },
+          { "kind": "write", "text": "远端 feature/<完整软件名 P1-P8> 分支内容（main/dev 保持空分支）" },
+          { "kind": "show", "text": "创建进度通知：提交推送阶段" }
+        ]}
+      ]
+    },
+    "16": {
+      "actors": [
+        { "name": "软件集成工程师", "items": [
+          { "kind": "act", "text": "在 VS Code 中首次打开新创建的仓库" }
+        ]},
+        { "name": "扩展", "kind": "system", "items": [
+          { "kind": "read", "text": "本地仓库打开状态（是否首次）" },
+          { "kind": "show", "text": "创建结果通知：仓库地址 + 「打开仓库」按钮" },
+          { "kind": "act", "text": "分流：首次打开 → 进入场景 1.2 初始化流程；否则 → 日常维护流程" }
+        ]}
+      ]
+    }
+  }
+}

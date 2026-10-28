@@ -1,0 +1,111 @@
+{
+  "kind": "wizard",
+  "title": "新建软件类型仓库",
+  "desc": "场景 1.1 工具原型 · 由软件集成工程师在 VS Code 中执行，完成远端仓库创建与初始配置",
+  "computed": [
+    { "key": "repoName", "label": "仓库名（实时生成）", "template": "{project}_{p6}_{p5}{p4}", "preview": true },
+    { "key": "swName", "label": "完整软件名 P1-P8", "template": "{p1}{p2}{p3}{p4}{p5}{p6}-{p7}-{p8}", "preview": true }
+  ],
+  "screens": [
+    {
+      "id": "project",
+      "title": "选择项目",
+      "desc": "从 Polarion 中选择当前用户有权限的项目空间；P1 / P2 / P3 由扩展自动映射，不可修改",
+      "flowSteps": "步骤 1-2",
+      "fields": [
+        { "key": "project", "label": "Polarion 项目", "type": "select", "required": true,
+          "options": ["MCU2441G4MBB", "MCU2443G4PBB", "TC397G4MBB"],
+          "default": "MCU2441G4MBB",
+          "help": "仅列出当前用户有写权限的项目空间（下拉 + 搜索）" },
+        { "key": "p1", "label": "P1 产品类型（自动）", "type": "text", "default": "M0", "readonly": true,
+          "help": "GPULSE Configuration 按项目编号前三位映射（G-C047 固定映射表）" },
+        { "key": "p2", "label": "P2 平台信息（自动）", "type": "text", "default": "41", "readonly": true,
+          "help": "从 MCU 平台管理空间读取映射；读取不到默认填充 00" },
+        { "key": "p3", "label": "P3 客户项目号（自动）", "type": "text", "default": "021", "readonly": true,
+          "help": "GPULSE Configuration 按完整项目编号映射" }
+      ]
+    },
+    {
+      "id": "p4",
+      "title": "P4 软件类型",
+      "flowSteps": "步骤 3",
+      "fields": [
+        { "key": "p4", "label": "P4 软件类型", "type": "select", "required": true,
+          "options": ["P"], "default": "P",
+          "help": "按 G-C047 规范，默认 P；候选集按规范扩展（规格中直接加选项即可）" }
+      ]
+    },
+    {
+      "id": "p5p6",
+      "title": "P5 / P6",
+      "desc": "选择 P5 部件类型、P6 客户信息/平台小版本；选择后右侧实时生成仓库名",
+      "flowSteps": "步骤 4",
+      "fields": [
+        { "key": "p5", "label": "P5 部件类型", "type": "select", "required": true,
+          "options": ["A0"], "default": "A0", "help": "默认 A0，可修改" },
+        { "key": "p6", "label": "P6 客户信息", "type": "text", "required": true, "default": "ZZ",
+          "help": "客户项目默认 ZZ；平台项目不复用默认 00；平台项目复用上一版时自动填充且不可修改" }
+      ]
+    },
+    {
+      "id": "p7p8",
+      "title": "P7 / P8 初始版本",
+      "flowSteps": "步骤 5",
+      "fields": [
+        { "key": "p7", "label": "P7 平台/硬件版本", "type": "text", "required": true, "default": "A0",
+          "help": "默认 A0，可修改；平台项目使用上一版硬件版本时填充 00 且不可修改" },
+        { "key": "p8", "label": "P8 软件版本", "type": "text", "required": true, "default": "100",
+          "validate": { "regex": "^(?!.*[IO])[0-9A-Za-z]{3}$", "message": "P8 须为 3 位，且不能包含 I/O" },
+          "help": "默认 100，实时校验格式" }
+      ]
+    },
+    {
+      "id": "compiler",
+      "title": "编译器",
+      "flowSteps": "步骤 6",
+      "fields": [
+        { "key": "compiler", "label": "编译器及版本", "type": "select", "required": true,
+          "options": ["Tasking v6.3r1", "HighTec v4.9.3", "HighTec v4.9.4"],
+          "default": "Tasking v6.3r1",
+          "help": "扩展根据选择生成初始 Gp_Build.xml，并记录到本地配置" }
+      ]
+    },
+    {
+      "id": "template",
+      "title": "初始模板",
+      "flowSteps": "步骤 7",
+      "fields": [
+        { "key": "template", "label": "项目初始模板", "type": "select", "required": true,
+          "options": ["默认模板（标准工程骨架）"],
+          "default": "默认模板（标准工程骨架）",
+          "help": "当前仅一套默认模板；未来按项目类型扩展多套或支持自定义" }
+      ]
+    }
+  ],
+  "confirm": {
+    "title": "确认创建",
+    "note": "确认后扩展将生成第一版集成登记表（模块列表为空），并创建远端仓库完成初始配置。",
+    "fields": ["repoName", "swName", "compiler", "template"]
+  },
+  "run": {
+    "button": "确认创建",
+    "stages": [
+      "生成第一版集成登记表（模块列表为空）",
+      "调用 GitLab API 创建远端仓库",
+      "配置仓库成员权限（软件集成工程师 Maintainer / 软件开发工程师 Developer）",
+      "从模板仓库复制初始框架（配置文件、目录结构）",
+      "根据编译器版本生成初始 Gp_Build.xml",
+      "生成初始 integration.yaml（模块列表为空）",
+      "创建 main / dev / feature/<完整软件名 P1-P8> 分支，初始文件推送至 feature 分支"
+    ],
+    "successTitle": "仓库创建成功",
+    "successFields": [
+      { "label": "远端仓库", "template": "G4_Projects/MCU/MCU2441G4MBB/{repoName}" },
+      { "label": "初始分支", "template": "main、dev（空）；feature/<完整软件名 P1-P8>（含初始文件）" }
+    ],
+    "actions": [
+      { "label": "打开仓库", "primary": true, "toast": "原型演示：此处将打开 {repoName} 并进入场景 1.2 首次初始化流程" },
+      { "label": "重新演示", "reset": true }
+    ]
+  }
+}

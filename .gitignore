@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# 平台运行数据（项目库/AI 配置，含本地凭据，不入库）
+data/
+
+# 开发产物（后台 agent 生成的真实工具，成熟后可单独发布为独立仓库）
+tools/
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

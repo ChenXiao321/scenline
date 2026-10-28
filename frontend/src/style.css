@@ -1,0 +1,18 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --border: #e2e5ea;
+  --text: #1f2329;
+  --text-dim: #6b7280;
+  --accent: #2563eb;
+  --accent-soft: #dbeafe;
+  --system: #7c3aed;
+  --system-soft: #ede9fe;
+  --warn: #b45309;
+  --warn-soft: #fef3c7;
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); }
+#app { height: 100vh; display: flex; flex-direction: column; }
+button { cursor: pointer; font: inherit; }

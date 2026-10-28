@@ -90,6 +90,40 @@ PROJECT_MIGRATIONS = [
     "ALTER TABLE scenario ADD COLUMN version TEXT NOT NULL DEFAULT ''",     # 归属的工具发布版本，如 v0.1.0
 ]
 
+# 项目级键值表（全局约定等，key 单行）
+PROJECT_KV_SCHEMA = """
+CREATE TABLE IF NOT EXISTS project_kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
+"""
+
+# 场景变更历史：谁在什么时间改了什么（AI 应用 change / 手工编辑 / 开发标记）
+PROJECT_CHANGELOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS scenario_change_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scenario_code TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',   -- 一句话总结（AI 生成 / 手工编辑由平台总结字段差异）
+    detail TEXT NOT NULL DEFAULT '',    -- 字段级明细 JSON：{field: {before:..., after:...}} 或文本
+    version TEXT NOT NULL DEFAULT '',   -- 变更时场景归属的工具版本快照
+    origin TEXT NOT NULL DEFAULT '',    -- ai_apply | manual_edit | develop_mark | ai_prototype 等
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chg_code ON scenario_change_log(scenario_code, id);
+"""
+
+# 实测记录：真实环境试用工具时记的"与预期不一致"的点，可汇总反馈给开发 agent
+PROJECT_FINDINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS finding (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scenario_code TEXT NOT NULL,
+    text TEXT NOT NULL,              -- 不一致点描述
+    status TEXT NOT NULL DEFAULT 'open',  -- open（待反馈） | fed（已反馈给开发）
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_finding_code ON finding(scenario_code, id);
+"""
+
 
 def _connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
@@ -169,6 +203,9 @@ class ProjectStore:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with _open(self.db_path) as c:
             c.executescript(PROJECT_SCHEMA)
+            c.executescript(PROJECT_KV_SCHEMA)
+            c.executescript(PROJECT_CHANGELOG_SCHEMA)
+            c.executescript(PROJECT_FINDINGS_SCHEMA)
             for sql in PROJECT_MIGRATIONS:
                 try:
                     c.execute(sql)
@@ -420,6 +457,107 @@ class ProjectStore:
     def clear_chat_messages(self) -> None:
         with self._conn() as c:
             c.execute("DELETE FROM chat_message")
+
+    # ---------------------------------------------------------- 全局约定
+    def get_global_notes(self) -> str:
+        """项目级全局约定（架构规则/外部系统约定/命名规范等），注入开发 prompt 与对话 AI 上下文。"""
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM project_kv WHERE key = 'global_notes'").fetchone()
+        return row["value"] if row else ""
+
+    def save_global_notes(self, text: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO project_kv(key, value) VALUES ('global_notes', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (text,),
+            )
+
+    # ---------------------------------------------------------- 场景变更历史
+    def log_scenario_change(self, code: str, summary: str, detail: str = "",
+                            version: str = "", origin: str = "") -> None:
+        """追加一条场景变更记录。version 由调用方给（当时场景的版本快照）。"""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO scenario_change_log(scenario_code, summary, detail, version, origin, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (code, summary, detail, version, origin, time.time()),
+            )
+
+    def list_scenario_changes(self, code: str, limit: int = 100) -> list[dict]:
+        """某场景的变更历史，倒序（最新在前）。"""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, summary, detail, version, origin, created_at FROM scenario_change_log "
+                "WHERE scenario_code = ? ORDER BY id DESC LIMIT ?",
+                (code, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def scenario_version_of(self, code: str) -> str:
+        """场景当前归属的工具版本（记变更历史时做快照用）。"""
+        with self._conn() as c:
+            row = c.execute("SELECT version FROM scenario WHERE code = ?", (code,)).fetchone()
+        return row["version"] if row else ""
+
+    # ---------------------------------------------------------- 版本总结
+    def get_version_summary(self, version: str) -> str:
+        """某工具版本的 AI 总结（确认场景时后台生成）。"""
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM project_kv WHERE key = ?", (f"version_summary:{version}",)).fetchone()
+        return row["value"] if row else ""
+
+    def save_version_summary(self, version: str, text: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO project_kv(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (f"version_summary:{version}", text),
+            )
+
+    def list_scenarios_by_version(self, version: str) -> list[str]:
+        """某版本号下的所有场景号（生成版本总结的上下文用）。"""
+        with self._conn() as c:
+            rows = c.execute("SELECT code FROM scenario WHERE version = ? ORDER BY CAST(code AS REAL), code", (version,)).fetchall()
+        return [r["code"] for r in rows]
+
+    # ---------------------------------------------------------- 实测记录
+    def add_finding(self, code: str, text: str) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO finding(scenario_code, text, status, created_at) VALUES (?,?, 'open', ?)",
+                (code, text, time.time()),
+            )
+            return cur.lastrowid
+
+    def list_findings(self, code: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, text, status, created_at FROM finding WHERE scenario_code = ? ORDER BY id DESC",
+                (code,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def open_findings(self) -> list[dict]:
+        """所有待反馈的实测记录（汇总反馈给开发 agent 用）。"""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, scenario_code, text, status, created_at FROM finding WHERE status = 'open' ORDER BY scenario_code, id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_findings_fed(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        with self._conn() as c:
+            c.execute(
+                f"UPDATE finding SET status = 'fed' WHERE id IN ({','.join('?' * len(ids))})",
+                ids,
+            )
+
+    def delete_finding(self, finding_id: int) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM finding WHERE id = ?", (finding_id,))
 
 
 class PlatformStore:

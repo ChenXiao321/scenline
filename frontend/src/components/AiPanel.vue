@@ -153,6 +153,8 @@ async function copyIssue(iss, ev) {
 }
 
 function preview(change) {
+  // update_global_notes 用 text（字符串），其余用 data_patch/spec
+  if (change.action === 'update_global_notes') return change.text || ''
   return JSON.stringify(change.data_patch || change.spec || {}, null, 2)
 }
 

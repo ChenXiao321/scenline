@@ -10,6 +10,7 @@ import RoleDetail from './components/RoleDetail.vue'
 import RoleCreate from './components/RoleCreate.vue'
 import AiPanel from './components/AiPanel.vue'
 import ToolDev from './components/ToolDev.vue'
+import GlobalNotes from './components/GlobalNotes.vue'
 import { parseFlowSteps, stepToScreens } from './composables/stepLink.js'
 import { setSysLabel, useSysLabel } from './composables/sysLabel.js'
 
@@ -68,16 +69,19 @@ const activeRole = ref(undefined) // undefined=未选；null=系统；对象=角
 const roleCreating = ref(false)   // 主区新增角色表单
 const showAi = ref(false)         // AI 面板开关
 const devView = ref(false)        // 主区是否显示「开发工具」视图
+const gnView = ref(false)         // 主区是否显示「全局约定」视图
 const showSysLabelEdit = ref(false) // 系统步骤显示名编辑
 const sysLabelDraft = ref('')
 const aiPanel = ref(null)         // AiPanel 实例
 const mainEl = ref(null)          // 主区元素（截图目标）
 const uiSpecRev = ref(0)          // ui_spec 变更信号：AI 应用后自增，驱动 ToolPrototype 重拉规格
+const globalNotesRev = ref(0)     // 全局约定变更信号：AI 应用后自增，驱动 GlobalNotes/ToolDev 重拉
 
 function onAiApplied(change) {
   // AI 修改落库后刷新数据，但**保留用户当前所在视图**（不重置 mode/focus），
   // 避免在「工具原型/流程原型」点应用时被拽回「场景详情」。
   if (change?.action === 'update_ui_spec') uiSpecRev.value += 1  // 通知工具原型重拉规格
+  if (change?.action === 'update_global_notes') globalNotesRev.value += 1  // 通知全局约定页/开发面板重拉
   const code = scenario.value?.code
   openWorkspace(ws.value.id).then(async () => {
     if (!code) return
@@ -129,6 +133,7 @@ function selectRole(r) {
   activeRole.value = r
   roleCreating.value = false
   devView.value = false
+  gnView.value = false
   scenario.value = null
   editMode.value = null
 }
@@ -162,6 +167,18 @@ function openScenarioFromRole(code) {
   activeRole.value = undefined
   openScenario(code)
 }
+
+// 场景详情页内的角色视角切换：只换视角，停留在场景页（不跳角色详情）
+// 传 '' 表示取消视角；同名再点一次=取消
+function switchScenarioRole(name) {
+  if (!name) { scenarioRoleName.value = ''; return }
+  scenarioRoleName.value = scenarioRoleName.value === name ? '' : name
+}
+// 场景内的视角选择独立于左侧角色选中态（activeRole 是"看角色资料"的入口）
+const scenarioRoleName = ref('')
+const scenarioActiveRole = computed(() =>
+  scenarioRoleName.value ? (ws.value?.roles.find(r => r.name === scenarioRoleName.value) || { name: scenarioRoleName.value }) : undefined
+)
 const loading = ref(false)
 const error = ref('')
 
@@ -195,6 +212,7 @@ async function openWorkspace(id) {
     sysLabelDraft.value = ws.value.settings?.system_label || ''
     scenario.value = null
     devView.value = false
+    gnView.value = false
   } catch (e) { error.value = e.message }
   loading.value = false
 }
@@ -204,9 +222,11 @@ async function openScenario(code) {
   try {
     scenario.value = await api(`/api/workspaces/${ws.value.id}/scenarios/${encodeURIComponent(code)}`)
     versionDraft.value = scenario.value.version || ''
+    scenarioRoleName.value = ''  // 换场景重置视角
     mode.value = 'browse'
     editMode.value = null
     devView.value = false
+    gnView.value = false
     activeRole.value = undefined
     roleCreating.value = false
   } catch (e) { error.value = e.message }
@@ -245,12 +265,24 @@ function goHome() {
   activeRole.value = undefined
   roleCreating.value = false
   devView.value = false
+  gnView.value = false
   error.value = ''
 }
 
 // 打开「开发工具」视图（工作域级，退出场景/角色选中态）
 function openDevView() {
   devView.value = true
+  gnView.value = false
+  scenario.value = null
+  editMode.value = null
+  activeRole.value = undefined
+  roleCreating.value = false
+}
+
+// 打开「全局约定」视图（工作域级）
+function openGnView() {
+  gnView.value = true
+  devView.value = false
   scenario.value = null
   editMode.value = null
   activeRole.value = undefined
@@ -306,9 +338,9 @@ const currentScreenSteps = computed(() => {
     : null
   return parseFlowSteps(sc?.flowSteps)
 })
-// 某步骤号对应的工具屏索引列表
+// 某步骤号对应的工具屏索引列表（步骤号统一字符串，支持 "3a" 变体号）
 function screensForStep(no) {
-  return step2screens.value.get(no) || []
+  return step2screens.value.get(String(no)) || []
 }
 
 async function deleteWorkspace() {
@@ -369,6 +401,7 @@ onMounted(loadWorkspaces)
           <div class="syslabel-hint">流程中由工具自动执行的步骤显示为该名称；留空恢复「系统」。</div>
         </div>
         <div class="role-chip system" :class="{ active: activeRole === null }" @click="selectRole(null)">{{ sysLabel }}</div>
+        <button class="btn dev-entry" :class="{ active: gnView }" title="跨场景的架构规则/外部系统约定：写场景时沉淀到这里，对话 AI 与后台开发都会遵守" @click="openGnView">📜 全局约定</button>
         <button class="btn dev-entry" :class="{ active: devView }" title="确认原型与文档后，让 claude 在独立文件夹里开发真正可发布的工具" @click="openDevView">🛠 开发工具</button>
       </div>
       <div class="side-section">
@@ -404,7 +437,8 @@ onMounted(loadWorkspaces)
 
     <main class="main" ref="mainEl" @mouseup="onMainMouseUp">
       <button v-if="selText" class="send-ai-fab" title="把选中内容发给 AI" @click="sendSelectionToAi">✦ 发给 AI</button>
-      <ToolDev v-if="devView" :ws-id="ws.id" @open-scenario="openScenario" />
+      <ToolDev v-if="devView" :ws-id="ws.id" :reload-rev="globalNotesRev" @open-scenario="openScenario" />
+      <GlobalNotes v-else-if="gnView" :ws-id="ws.id" :reload-rev="globalNotesRev" />
       <ScenarioEditor v-else-if="editMode === 'create'" :ws-id="ws.id" :scenario="null" :roles="ws.roles" @close="editMode = null" @saved="onScenarioSaved" @deleted="onScenarioDeleted" />
       <div v-else-if="loading" class="placeholder">加载中…</div>
       <RoleCreate v-else-if="roleCreating" :ws-id="ws.id" @close="roleCreating = false" @created="onRoleCreated" />
@@ -441,7 +475,7 @@ onMounted(loadWorkspaces)
           当前界面屏对应流程步骤：{{ currentScreenSteps.join('、') }}
           <button class="link" @click="requestFocus('play', { step: currentScreenSteps[0] })">→ 在流程原型中查看</button>
         </div>
-        <ScenarioView v-if="mode === 'browse'" :scenario="scenario" :focus="focusTarget" @focus-step="(no) => requestFocus('play', { step: no })" @send-to-ai="onScenarioSendToAi" />
+        <ScenarioView v-if="mode === 'browse'" :scenario="scenario" :focus="focusTarget" :active-role="scenarioActiveRole" :ws-id="ws.id" @focus-step="(no) => requestFocus('play', { step: no })" @send-to-ai="onScenarioSendToAi" @switch-role="switchScenarioRole" />
         <PrototypePlayer v-else-if="mode === 'play'" :ws-id="ws.id" :scenario="scenario" :roles="ws.roles" :focus="focusTarget" :reload-rev="uiSpecRev" @focus-tool="(idx) => requestFocus('tool', { screenIdx: idx })" @focus-step="(no) => requestFocus('browse', { step: no })" />
         <ToolPrototype v-else :ws-id="ws.id" :code="scenario.code" :roles="ws.roles" :focus="focusTarget" :reload-rev="uiSpecRev" @focus-step="(no) => requestFocus('play', { step: no })" @gen-requirements="onGenRequirements" />
         </template>

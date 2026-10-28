@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 from dataclasses import asdict
 from pathlib import Path
 
@@ -62,7 +63,7 @@ from ai_service import AiService, parse_changes
 from dev_service import DevManager, PROMPT_TEMPLATE, _slugify
 
 ai = AiService(BASE_DIR.parent / "data" / "ai-config.json")
-dev = DevManager(BASE_DIR.parent / "tools")
+dev = DevManager(BASE_DIR.parent / "data" / "projects")
 
 app = FastAPI(title="场景流程原型平台")
 app.add_middleware(
@@ -281,12 +282,79 @@ def update_scenario(ws_id: int, code: str, req: ScenarioSaveRequest):
     if not store.get_workspace(ws_id):
         raise HTTPException(404, "工作域不存在")
     proj = store.project(ws_id)
-    if not proj.get_scenario(code):
+    old = proj.get_scenario(code)
+    if not old:
         raise HTTPException(404, f"场景 {code} 不存在")
     if not req.title.strip():
         raise HTTPException(400, "场景标题不能为空")
     proj.update_scenario(code, req.title.strip(), req.domain.strip(), req.data, req.pending)
+    # 变更历史：手工编辑（平台总结字段差异）
+    changed = _diff_scenario_fields(old, req)
+    if changed:
+        proj.log_scenario_change(code, "手工编辑：" + "、".join(changed),
+                                 json.dumps(changed, ensure_ascii=False), old.get("version", ""), "manual_edit")
     return {"saved": True}
+
+
+def _diff_scenario_fields(old: dict, req) -> list[str]:
+    """对比新旧场景，返回变更了的字段名列表（手工编辑的历史摘要用）。"""
+    changed = []
+    if req.title.strip() != old["title"]:
+        changed.append("标题")
+    if req.domain.strip() != old.get("domain", ""):
+        changed.append("分组")
+    od, nd = old["data"], req.data
+    for k in set(od) | set(nd):
+        if od.get(k) != nd.get(k):
+            changed.append(k)
+    if req.pending != old["pending"]:
+        changed.append("pending")
+    return changed
+
+
+@app.get("/api/workspaces/{ws_id}/scenarios/{code}/changes")
+def list_scenario_changes(ws_id: int, code: str):
+    """场景变更历史（倒序）。详情页「变更历史」区用。"""
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    proj = store.project(ws_id)
+    if not proj.get_scenario(code):
+        raise HTTPException(404, f"场景 {code} 不存在")
+    return {"changes": proj.list_scenario_changes(code)}
+
+
+# ---------------------------------------------------------- 实测记录（试用工具时记不一致点）
+
+
+class FindingRequest(BaseModel):
+    text: str
+
+
+@app.get("/api/workspaces/{ws_id}/scenarios/{code}/findings")
+def list_findings(ws_id: int, code: str):
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    return {"findings": store.project(ws_id).list_findings(code)}
+
+
+@app.post("/api/workspaces/{ws_id}/scenarios/{code}/findings")
+def add_finding(ws_id: int, code: str, req: FindingRequest):
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    proj = store.project(ws_id)
+    if not proj.get_scenario(code):
+        raise HTTPException(404, f"场景 {code} 不存在")
+    if not req.text.strip():
+        raise HTTPException(400, "内容不能为空")
+    return {"id": proj.add_finding(code, req.text.strip())}
+
+
+@app.delete("/api/workspaces/{ws_id}/findings/{finding_id}")
+def delete_finding(ws_id: int, finding_id: int):
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    store.project(ws_id).delete_finding(finding_id)
+    return {"deleted": True}
 
 
 class ScenarioStatusRequest(BaseModel):
@@ -313,7 +381,49 @@ def set_scenario_status(ws_id: int, code: str, req: ScenarioStatusRequest):
         if not (effective or "").strip():
             raise HTTPException(400, "切到「已确认」必须先填版本号（该场景归属的工具发布版本）")
     proj.set_scenario_status(code, status or None, req.version)
+    # 确认成功后：后台异步（重新）生成该版本的 AI 总结——新版本首个确认/已有版本新增确认场景都会刷新
+    if status == "已确认":
+        ver = (req.version if req.version is not None else sc["version"]).strip()
+        threading.Thread(target=_gen_version_summary, args=(ws_id, ver), daemon=True).start()
     return {"saved": True}
+
+
+def _gen_version_summary(ws_id: int, version: str) -> None:
+    """后台任务：汇总该版本下所有场景的变更历史，让 AI 生成一句话版本总结（release notes 风格）。"""
+    try:
+        proj = store.project(ws_id)
+        codes = proj.list_scenarios_by_version(version)
+        if not codes:
+            return
+        lines = []
+        for c in codes:
+            sc = proj.get_scenario(c)
+            if not sc:
+                continue
+            lines.append(f"## 场景 {c}：{sc['title']}")
+            for ch in proj.list_scenario_changes(c, limit=50):
+                if ch["summary"]:
+                    lines.append(f"- {ch['summary']}")
+        prompt = (
+            f"你是工具发布经理。下面是工具版本 {version} 包含的场景及其变更明细。"
+            "请写一段 3-6 句的版本总结（release notes 风格）：这个版本主要交付了什么能力、覆盖哪些场景、有什么重要行为变化。"
+            "用中文，面向阅读变更记录的人，不要逐条复述，要归纳。直接输出总结正文，不要标题和前缀。\n\n"
+            + "\n".join(lines)
+        )
+        text, _ = ai.chat([{"role": "user", "content": prompt}])
+        text = (text or "").strip()
+        if text:
+            proj.save_version_summary(version, text)
+    except Exception:
+        logging.getLogger("uvicorn.error").exception("生成版本总结失败 ws=%s version=%s", ws_id, version)
+
+
+@app.get("/api/workspaces/{ws_id}/version-summary")
+def get_version_summary(ws_id: int, version: str):
+    """某工具版本的 AI 总结（可能为空：后台还没生成完）。"""
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    return {"version": version, "summary": store.project(ws_id).get_version_summary(version)}
 
 
 @app.delete("/api/workspaces/{ws_id}/scenarios/{code}")
@@ -588,9 +698,13 @@ def ai_chat(req: AiChatRequest):
             ai.load_config().get("provider"), ai._claude_cli_path())
         raise HTTPException(400, "AI 未就绪（claude-cli 需本机装 claude，其他模式需配 API key）")
 
-    # 组装上下文：平台位置 + 选中内容 + 场景数据
+    # 组装上下文：平台位置 + 全局约定 + 选中内容 + 场景数据
     ws = store.get_workspace(req.ws_id)
     ctx = [f"【平台位置】项目「{ws['name'] if ws else req.ws_id}」"]
+    proj = store.project(req.ws_id)
+    global_notes = proj.get_global_notes().strip()
+    if global_notes:
+        ctx.append(f"【项目全局约定】（跨场景的架构/外部系统约定，回答与提 change 时都必须遵守）\n{global_notes}")
     if req.scenario_code:
         ctx.append(f"场景 {req.scenario_code}，视图：{req.view or '未知'}")
     if req.selection:
@@ -600,7 +714,6 @@ def ai_chat(req: AiChatRequest):
         ctx.append(brief)
 
     # 上一条回复若含解析失败的 change，自动提醒 AI 重发（用户不用手动发现坏 JSON）
-    proj = store.project(req.ws_id)
     invalid_summary = proj.last_invalid_change_summary()
     if invalid_summary:
         ctx.append(
@@ -667,6 +780,20 @@ def ai_apply(req: AiApplyRequest):
     proj = store.project(ws_id)
     code = c.get("code", "")
     action = c.get("action", "")
+
+    # 全局约定不属于任何场景：先处理，不走下面的场景校验
+    if action == "update_global_notes":
+        text = c.get("text")
+        if not isinstance(text, str):
+            raise HTTPException(400, "update_global_notes 缺少 text（全局约定完整新文本）")
+        proj.save_global_notes(text)
+        # 记一条项目级变更（scenario_code 用占位符，便于在变更历史里识别来源）
+        proj.log_scenario_change(
+            "__global__", c.get("summary", "AI 更新全局约定"), "",
+            "", "ai_apply",
+        )
+        return {"applied": True, "action": action, "code": ""}
+
     sc = proj.get_scenario(code)
     if not sc:
         raise HTTPException(404, f"场景 {code} 不存在")
@@ -674,24 +801,58 @@ def ai_apply(req: AiApplyRequest):
     if action == "update_scenario":
         data = sc["data"]
         patch = c.get("data_patch", {})
-        allowed = {"value", "main_users", "not_covered", "triggers", "preconditions", "steps", "variants", "acceptance", "exceptions", "ui_material", "notes"}
+        allowed = {"value", "main_users", "not_covered", "triggers", "preconditions", "steps", "variants", "acceptance", "exceptions", "ui_material", "notes", "role_views"}
         for k, v in patch.items():
             if k in allowed:
                 data[k] = v
+        # 列级字段：patch 带 domain/title 时一起更新（它们是独立列，不在 data JSON 里）
+        domain = patch["domain"] if "domain" in patch else sc.get("domain", "")
+        title = patch.get("title", sc["title"])
         # pending 是独立列（不在 data JSON 里）：patch 带 pending 时整体替换，否则保留旧值
         pending = patch["pending"] if "pending" in patch else sc["pending"]
-        proj.update_scenario(code, sc["title"], sc.get("domain", ""), data, pending)
+        proj.update_scenario(code, title, domain, data, pending)
+        # 变更历史：AI 的 summary 即变更总结，detail 记录动了哪些字段
+        proj.log_scenario_change(
+            code, c.get("summary", "AI 修改场景"),
+            json.dumps({"fields": sorted(patch.keys())}, ensure_ascii=False),
+            sc.get("version", ""), "ai_apply",
+        )
     elif action == "update_process_spec":
         if not isinstance(c.get("spec"), dict):
             raise HTTPException(400, "缺少 spec")
         proj.save_process_spec(code, c["spec"])
+        proj.log_scenario_change(code, c.get("summary", "AI 更新过程拆解"), "", sc.get("version", ""), "ai_apply")
     elif action == "update_ui_spec":
         if not isinstance(c.get("spec"), dict):
             raise HTTPException(400, "缺少 spec")
         proj.save_ui_spec(code, c["spec"])
+        proj.log_scenario_change(code, c.get("summary", "AI 更新工具原型"), "", sc.get("version", ""), "ai_apply")
     else:
         raise HTTPException(400, f"未知 action：{action}")
     return {"applied": True, "action": action, "code": code}
+
+
+# ---------------------------------------------------------- 全局约定
+
+
+class GlobalNotesRequest(BaseModel):
+    text: str = ""
+
+
+@app.get("/api/workspaces/{ws_id}/global-notes")
+def get_global_notes(ws_id: int):
+    """项目级全局约定（跨场景的架构规则/外部系统约定等），注入开发 prompt 和对话 AI 上下文。"""
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    return {"text": store.project(ws_id).get_global_notes()}
+
+
+@app.put("/api/workspaces/{ws_id}/global-notes")
+def put_global_notes(ws_id: int, req: GlobalNotesRequest):
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    store.project(ws_id).save_global_notes(req.text)
+    return {"saved": True}
 
 
 # ---------------------------------------------------------- 后台工具开发
@@ -768,7 +929,7 @@ def develop_target(ws_id: int):
 
 @app.post("/api/workspaces/{ws_id}/develop")
 def develop_start(ws_id: int, req: DevelopRequest):
-    """启动后台开发任务：组装场景+原型 prompt，起 claude agent 在 tools/<tool>/ 自主开发。"""
+    """启动后台开发任务：组装场景+原型 prompt，起 claude agent 在 data/projects/ws-<id>/tools/<tool>/ 自主开发。"""
     ws = store.get_workspace(ws_id)
     if not ws:
         raise HTTPException(404, "工作域不存在")
@@ -796,9 +957,11 @@ def develop_start(ws_id: int, req: DevelopRequest):
         raise HTTPException(400, "所选场景都还没有工具原型（ui_spec），请先在工具原型里确认界面再开发")
 
     cfg = ai.load_config()
+    global_notes = proj.get_global_notes().strip()
     prompt = PROMPT_TEMPLATE.format(
         tool_name=label,
         work_dir=str(work_dir),
+        global_block=global_notes or "（无；本项目尚未填写全局约定，可在「🛠 开发工具」面板顶部的「📜 全局约定」里维护）",
         scenarios_block="".join(sc_lines),
         ui_specs_block="".join(us_lines) or "（无）",
         existing_block=_existing_block(work_dir),
@@ -818,8 +981,12 @@ def develop_mark(ws_id: int):
     if not task or task.status != "done":
         return {"marked": False, "reason": "无已完成任务"}
     proj = store.project(ws_id)
-    proj.mark_scenarios_developed(task.codes, getattr(task, "version", ""))
-    return {"marked": True, "codes": task.codes, "version": getattr(task, "version", "")}
+    ver = getattr(task, "version", "")
+    proj.mark_scenarios_developed(task.codes, ver)
+    for code in task.codes:
+        proj.log_scenario_change(code, f"工具开发完成，标记「已开发」{('（版本 ' + ver + '）') if ver else ''}",
+                                 "", ver, "develop_mark")
+    return {"marked": True, "codes": task.codes, "version": ver}
 
 
 @app.get("/api/workspaces/{ws_id}/develop/status")
@@ -840,6 +1007,52 @@ def develop_input(ws_id: int, req: DevInputRequest):
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     return {"continued": True, "status": task.status}
+
+
+@app.post("/api/workspaces/{ws_id}/develop/resume")
+def develop_resume(ws_id: int):
+    """error（网络/进程中断）后续开发：重启 claude 进程，重发上下文，从中断处继续。"""
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    try:
+        task = dev.resume(ws_id)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {"resumed": True, "status": task.status}
+
+
+class DevFeedbackRequest(BaseModel):
+    text: str = ""               # 手写的反馈内容
+    include_findings: bool = False  # 同时汇总所有「待反馈」的实测记录
+
+
+@app.post("/api/workspaces/{ws_id}/develop/feedback")
+def develop_feedback(ws_id: int, req: DevFeedbackRequest):
+    """done/error 后反馈修正：把用户反馈（可附带实测记录汇总）发给开发 agent 修正。"""
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    parts = []
+    if req.text.strip():
+        parts.append(req.text.strip())
+    fed_ids: list[int] = []
+    if req.include_findings:
+        proj = store.project(ws_id)
+        opens = proj.open_findings()
+        if opens:
+            lines = ["", "【真实环境实测记录的不一致点】"]
+            for f in opens:
+                lines.append(f"- 场景 {f['scenario_code']}：{f['text']}")
+                fed_ids.append(f["id"])
+            parts.append("\n".join(lines))
+    if not parts:
+        raise HTTPException(400, "反馈内容为空（写点内容，或勾选汇总实测记录）")
+    try:
+        task = dev.feedback(ws_id, "\n\n".join(parts))
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    if fed_ids:
+        store.project(ws_id).mark_findings_fed(fed_ids)
+    return {"started": True, "status": task.status, "findings_fed": len(fed_ids)}
 
 
 @app.post("/api/workspaces/{ws_id}/develop/stop")

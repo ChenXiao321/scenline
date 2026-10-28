@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 
-const props = defineProps({ wsId: Number })
+const props = defineProps({ wsId: Number, reloadRev: { type: Number, default: 0 } })
 const emit = defineEmits(['open-scenario'])
 
 // 场景状态点颜色（与 App.vue 一致）
@@ -68,6 +68,22 @@ function toggleGroup(items) {
   checked.value = s
 }
 
+// ---------------- 全局约定（只读摘要，编辑在左侧「📜 全局约定」页） ----------------
+const globalNotes = ref('')
+
+async function loadGlobalNotes() {
+  try {
+    const r = await api(`/api/workspaces/${props.wsId}/global-notes`)
+    globalNotes.value = r.text || ''
+  } catch { /* 静默 */ }
+}
+watch(() => props.wsId, loadGlobalNotes, { immediate: true })
+watch(() => props.reloadRev, loadGlobalNotes)   // AI 应用 update_global_notes 后刷新只读摘要
+
+// 摘要：非空行取前 6 行预览
+const gnPreview = computed(() =>
+  globalNotes.value.split('\n').map(l => l.trim()).filter(Boolean).slice(0, 6))
+
 // ---------------- 开发任务状态 ----------------
 const task = ref({ status: 'idle', log_tail: [], files: [], codes: [] })
 const starting = ref(false)
@@ -133,6 +149,42 @@ async function stop() {
   await poll()
 }
 
+// error（网络/进程中断）后续开发：重启 claude 进程从中断处继续，已完成文件保留
+const resuming = ref(false)
+async function resume() {
+  resuming.value = true
+  startErr.value = ''
+  try {
+    await api(`/api/workspaces/${props.wsId}/develop/resume`, { method: 'POST' })
+    await poll()
+    scrollLog()
+  } catch (e) { startErr.value = e.message }
+  resuming.value = false
+}
+
+// ---------------- 反馈修正（done/error 后把问题发给开发 agent） ----------------
+const fbText = ref('')
+const fbIncludeFindings = ref(true)
+const fbSending = ref(false)
+const canFeedback = computed(() => ['done', 'error'].includes(task.value.status) && task.value.codes?.length && !busy.value)
+
+async function sendFeedback() {
+  fbSending.value = true
+  startErr.value = ''
+  try {
+    const r = await api(`/api/workspaces/${props.wsId}/develop/feedback`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: fbText.value, include_findings: fbIncludeFindings.value }),
+    })
+    fbText.value = ''
+    marked.value = false   // 反馈修正完成后允许重新标记已开发
+    if (r.findings_fed) startErr.value = ''
+    await poll()
+    scrollLog()
+  } catch (e) { startErr.value = e.message }
+  fbSending.value = false
+}
+
 onMounted(() => { poll(); pollTimer = setInterval(poll, 2000) })
 onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 
@@ -167,6 +219,18 @@ const statusInfo = computed(() => STATUS[task.value.status] || STATUS.idle)
       </div>
 
       <div v-if="!target.ai_ready" class="warn-bar">AI 未就绪：后台开发依赖本机 claude CLI，请先在「✦ AI」设置里确认 provider 可用。</div>
+
+      <!-- 全局约定只读摘要：编辑在左侧「📜 全局约定」页；开发时会全量注入 prompt -->
+      <details class="gn">
+        <summary>
+          📜 全局约定
+          <span class="dim">{{ globalNotes ? `（已配置，开发时将作为最高优先级约束注入；到左侧「📜 全局约定」页编辑）` : '（未配置——建议先到左侧「📜 全局约定」页维护跨场景规则）' }}</span>
+        </summary>
+        <div v-if="globalNotes" class="gn-preview">
+          <div v-for="(l, i) in gnPreview" :key="i" class="gn-line">{{ l }}</div>
+          <div class="dim">…（完整内容见左侧「📜 全局约定」页）</div>
+        </div>
+      </details>
 
       <div class="dev-body">
         <!-- 左：场景勾选 -->
@@ -230,9 +294,26 @@ const statusInfo = computed(() => STATUS[task.value.status] || STATUS.idle)
               <button class="btn primary sm" @click="sendReply">回复并继续</button>
             </div>
           </div>
-          <div v-else-if="task.status === 'error'" class="err-bar">❌ {{ task.error }}</div>
+          <div v-else-if="task.status === 'error'" class="err-bar">
+            ❌ {{ task.error }}
+            <div class="err-ops">
+              <button class="btn primary sm" :disabled="resuming" @click="resume">{{ resuming ? '续跑中…' : '↻ 继续（从中断处接着干）' }}</button>
+              <span class="dim">进程因网络/中断退出；已写入工具目录的文件保留，续跑时它会检查现状接着做，不从头重写。</span>
+            </div>
+          </div>
           <div v-else-if="task.status === 'done'" class="done-bar">
             ✅ 本轮开发完成。可继续勾选场景做增量开发，或到 <code>{{ task.work_dir }}</code> 查看产物。
+          </div>
+
+          <!-- 反馈修正：done/error 后人话描述问题，发给开发 agent 修 -->
+          <div v-if="canFeedback" class="feedback">
+            <div class="fb-title">💬 反馈修正 <span class="dim">测试/试用发现与预期不一致？人话描述，开发 agent 会修正并更新对照清单</span></div>
+            <textarea v-model="fbText" rows="3" placeholder="例：「进入工作空间」恢复上下文后没有重校验凭据；概览页仓库列表应是卡片不是表格…"></textarea>
+            <div class="fb-ops">
+              <label class="fb-chk"><input type="checkbox" v-model="fbIncludeFindings" /> 附带所有「待反馈」的实测记录（场景页记录的）</label>
+              <span class="spacer"></span>
+              <button class="btn primary sm" :disabled="fbSending || (!fbText.trim() && !fbIncludeFindings)" @click="sendFeedback">{{ fbSending ? '发送中…' : '发送给开发 agent 修正' }}</button>
+            </div>
           </div>
 
           <!-- 产物文件 -->
@@ -265,6 +346,13 @@ const statusInfo = computed(() => STATUS[task.value.status] || STATUS.idle)
 .status-badge.error { background: #fee2e2; color: #b91c1c; }
 
 .warn-bar { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; border-radius: 8px; padding: 8px 14px; font-size: 13px; margin-bottom: 12px; }
+
+/* 全局约定（只读摘要） */
+.gn { border: 1px solid var(--border); border-radius: 10px; background: #fff; padding: 10px 14px; margin-bottom: 12px; }
+.gn summary { font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
+.gn summary .dim { font-weight: 400; font-size: 12px; margin-left: 6px; }
+.gn-preview { margin-top: 8px; font-size: 12.5px; color: var(--text); line-height: 1.7; }
+.gn-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .dev-body { display: flex; gap: 14px; align-items: flex-start; }
 
@@ -306,8 +394,18 @@ const statusInfo = computed(() => STATUS[task.value.status] || STATUS.idle)
 .ni-ops { display: flex; gap: 8px; }
 .ni-ops input { flex: 1; border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; font-size: 13.5px; }
 .err-bar { border: 1px solid #fecaca; background: #fef2f2; color: #b91c1c; border-radius: 10px; padding: 10px 14px; font-size: 13px; }
+.err-ops { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.err-ops .dim { font-size: 12px; color: #7f1d1d; }
 .done-bar { border: 1px solid #a7f3d0; background: #ecfdf5; color: #047857; border-radius: 10px; padding: 10px 14px; font-size: 13px; }
 .done-bar code { background: #fff; padding: 1px 6px; border-radius: 4px; }
+
+/* 反馈修正 */
+.feedback { border: 1px solid #bfdbfe; background: #eff6ff; border-radius: 10px; padding: 10px 14px; }
+.fb-title { font-size: 13px; font-weight: 600; color: #1e40af; margin-bottom: 8px; }
+.fb-title .dim { font-weight: 400; font-size: 12px; margin-left: 6px; }
+.feedback textarea { width: 100%; box-sizing: border-box; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: inherit; line-height: 1.6; resize: vertical; }
+.fb-ops { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.fb-chk { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--text-dim); cursor: pointer; }
 
 .files { border: 1px solid var(--border); border-radius: 10px; background: #fff; padding: 10px 14px; }
 .files-title { font-size: 12px; font-weight: 600; color: var(--text-dim); margin-bottom: 6px; }

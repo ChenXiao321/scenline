@@ -3,8 +3,8 @@ import { ref, watch, nextTick, computed } from 'vue'
 import MermaidBlock from './MermaidBlock.vue'
 import { useSysLabel } from '../composables/sysLabel.js'
 
-const props = defineProps({ scenario: Object, focus: Object })
-const emit = defineEmits(['focus-step', 'send-to-ai'])
+const props = defineProps({ scenario: Object, focus: Object, activeRole: Object, wsId: Number })
+const emit = defineEmits(['focus-step', 'send-to-ai', 'switch-role'])
 
 const { isSys, displayActor } = useSysLabel()
 function isSystem(step) {
@@ -19,6 +19,114 @@ const LABEL_LINE_RE = /(?:^|\n)[ \t]*(?:[*_＊#>-]*[ \t]*)*流程图(?:[*_＊]*[
 const stripLabels = (t) => t.replace(LABEL_LINE_RE, '')
 const hasMermaid = computed(() => MERMAID_RE.test(notesText.value))
 const hasPlainText = computed(() => !!stripLabels(notesText.value.replace(new RegExp(MERMAID_RE.source, 'g'), '')).trim())
+
+// ---------------- 角色视角 ----------------
+// 步骤表所有角色共享；步骤上的 roles 数组限定可见角色；role_views 是各角色完整的界面/验收/说明描述
+const roleName = computed(() => props.activeRole?.name || '')
+const roleView = computed(() => (roleName.value && props.scenario?.data?.role_views?.[roleName.value]) || null)
+
+function stepVisible(s) {
+  if (!roleName.value) return true          // 未选角色：全部显示
+  return !s.roles?.length || s.roles.includes(roleName.value)
+}
+const visibleSteps = computed(() => (props.scenario?.data?.steps || []).filter(stepVisible))
+function visibleVariantSteps(v) { return (v.steps || []).filter(stepVisible) }
+
+// 界面素材 / 验收：选中角色且有独立视角时换成该角色的版本，否则用共享版
+const uiMaterial = computed(() => roleView.value?.ui_material?.length ? roleView.value.ui_material : (props.scenario?.data?.ui_material || []))
+const acceptance = computed(() => roleView.value?.acceptance?.length ? roleView.value.acceptance : (props.scenario?.data?.acceptance || []))
+
+// 场景内可切换的角色：main_users + role_views 里出现过的角色（去重，保持顺序）
+const switchableRoles = computed(() => {
+  const d = props.scenario?.data || {}
+  const names = [...(d.main_users || []), ...Object.keys(d.role_views || {})]
+  return [...new Set(names)]
+})
+function clickRole(name) {
+  emit('switch-role', roleName.value === name ? '' : name)  // 再点一次=取消视角
+}
+
+// ---------------- 变更历史 ----------------
+const changes = ref([])
+const ORIGIN_LABEL = { ai_apply: 'AI 应用', manual_edit: '手工编辑', develop_mark: '开发标记', ai_prototype: 'AI 原型' }
+async function loadChanges() {
+  changes.value = []
+  if (!props.wsId || !props.scenario?.code) return
+  try {
+    const res = await fetch(`/api/workspaces/${props.wsId}/scenarios/${encodeURIComponent(props.scenario.code)}/changes`)
+    if (res.ok) changes.value = (await res.json()).changes || []
+  } catch { /* 静默 */ }
+}
+watch(() => [props.wsId, props.scenario?.code], loadChanges, { immediate: true })
+
+// 版本总结：场景确认到某版本时后台 AI 生成；未生成完会显示"生成中"并稍后重试拉一次
+const verSummary = ref('')
+const verSummaryPending = ref(false)
+let vsTimer = null
+async function loadVersionSummary() {
+  clearTimeout(vsTimer)
+  verSummary.value = ''
+  verSummaryPending.value = false
+  const v = props.scenario?.version
+  if (!props.wsId || !v) return
+  try {
+    const res = await fetch(`/api/workspaces/${props.wsId}/version-summary?version=${encodeURIComponent(v)}`)
+    if (!res.ok) return
+    const s = ((await res.json()).summary || '').trim()
+    if (s) verSummary.value = s
+    else {
+      // 还没生成完：5 秒后再拉一次
+      verSummaryPending.value = true
+      vsTimer = setTimeout(loadVersionSummary, 5000)
+    }
+  } catch { /* 静默 */ }
+}
+watch(() => [props.wsId, props.scenario?.code, props.scenario?.version], loadVersionSummary, { immediate: true })
+function fmtTime(ts) {
+  const d = new Date(ts * 1000)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+function originLabel(o) { return ORIGIN_LABEL[o] || o || '变更' }
+function detailFields(detail) {
+  try { return JSON.parse(detail).fields || [] } catch { return [] }
+}
+
+// ---------------- 实测记录（真实环境试用时记不一致点，待反馈给开发 agent） ----------------
+const findings = ref([])
+const findingDraft = ref('')
+const findingSaving = ref(false)
+async function loadFindings() {
+  findings.value = []
+  if (!props.wsId || !props.scenario?.code) return
+  try {
+    const res = await fetch(`/api/workspaces/${props.wsId}/scenarios/${encodeURIComponent(props.scenario.code)}/findings`)
+    if (res.ok) findings.value = (await res.json()).findings || []
+  } catch { /* 静默 */ }
+}
+watch(() => [props.wsId, props.scenario?.code], loadFindings, { immediate: true })
+
+async function addFinding() {
+  const t = findingDraft.value.trim()
+  if (!t || findingSaving.value) return
+  findingSaving.value = true
+  try {
+    const res = await fetch(`/api/workspaces/${props.wsId}/scenarios/${encodeURIComponent(props.scenario.code)}/findings`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: t }),
+    })
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText)
+    findingDraft.value = ''
+    await loadFindings()
+  } catch { /* 静默 */ }
+  findingSaving.value = false
+}
+async function delFinding(f) {
+  try {
+    await fetch(`/api/workspaces/${props.wsId}/findings/${f.id}`, { method: 'DELETE' })
+    await loadFindings()
+  } catch { /* 静默 */ }
+}
+const openFindingCount = computed(() => findings.value.filter(f => f.status === 'open').length)
 
 // 跨视图联动：接收 focus 时滚动定位并短暂高亮该步骤行
 const flashNo = ref(null)
@@ -125,7 +233,15 @@ watch(() => actionMenu.value.show, (v) => {
     <blockquote v-if="scenario.data.value" class="value">{{ scenario.data.value }}</blockquote>
 
     <div class="meta-row">
-      <span v-if="scenario.data.main_users?.length"><b>主要用户：</b>{{ scenario.data.main_users.join('、') }}</span>
+      <span v-if="switchableRoles.length" class="role-switch">
+        <b>视角：</b>
+        <span
+          v-for="n in switchableRoles" :key="n"
+          class="role-opt" :class="{ active: roleName === n }"
+          :title="roleName === n ? '再点一次取消视角，恢复共享全貌' : `以「${n}」的视角查看本场景`"
+          @click="clickRole(n)"
+        >{{ n }}</span>
+      </span>
       <span v-if="scenario.data.not_covered?.length"><b>不覆盖：</b>{{ scenario.data.not_covered.join('、') }}</span>
       <span v-if="scenario.data.domain"><b>分组：</b>{{ scenario.data.domain }}</span>
     </div>
@@ -140,12 +256,17 @@ watch(() => actionMenu.value.show, (v) => {
       <ul><li v-for="(t, i) in scenario.data.preconditions" :key="i">{{ t }}</li></ul>
     </section>
 
-    <section v-if="scenario.data.steps?.length">
-      <h3>主流程（{{ scenario.data.steps.length }} 步）</h3>
+    <!-- 角色视角横幅：选中角色时提示当前看到的是该角色视角 -->
+    <div v-if="roleName" class="role-view-bar">
+      👤 当前按角色「{{ roleName }}」查看：步骤表仅显示与该角色相关的步骤{{ roleView ? '，界面/验收为该角色专属描述' : '（该角色暂无专属描述，界面/验收显示共享版）' }}
+    </div>
+
+    <section v-if="visibleSteps.length">
+      <h3>主流程（{{ visibleSteps.length }}{{ roleName ? ' / 共 ' + (scenario.data.steps?.length || 0) : '' }} 步）</h3>
       <table class="steps">
         <thead><tr><th class="no">步骤</th><th class="actor">角色</th><th>用户操作</th><th>系统响应</th></tr></thead>
         <tbody>
-          <tr v-for="s in scenario.data.steps" :key="s.no" class="step-row" :data-no="s.no" :class="{ system: isSystem(s), flash: flashNo === s.no }" :title="`左键单击弹出操作菜单，右键单击跳到流程原型步骤 ${s.no}`" @click="onRowClick($event, s)" @contextmenu.prevent.stop="emit('focus-step', s.no)">
+          <tr v-for="s in visibleSteps" :key="s.no" class="step-row" :data-no="s.no" :class="{ system: isSystem(s), flash: flashNo === s.no }" :title="`左键单击弹出操作菜单，右键单击跳到流程原型步骤 ${s.no}`" @click="onRowClick($event, s)" @contextmenu.prevent.stop="emit('focus-step', s.no)">
             <td class="no">{{ s.no }}</td>
             <td class="actor">{{ displayActor(s.actor) }}</td>
             <td>{{ isSystem(s) ? '' : s.action }}</td>
@@ -153,14 +274,20 @@ watch(() => actionMenu.value.show, (v) => {
           </tr>
         </tbody>
       </table>
+    </section>
+
+    <!-- 角色专属说明 -->
+    <section v-if="roleView?.notes" class="notes">
+      <h3>{{ roleName }} · 补充说明</h3>
+      <MermaidBlock :text="roleView.notes" />
     </section>
 
     <section v-for="v in scenario.data.variants" :key="v.name">
       <h3>{{ v.name }}</h3>
-      <table v-if="v.steps?.length" class="steps">
+      <table v-if="visibleVariantSteps(v).length" class="steps">
         <thead><tr><th class="no">步骤</th><th class="actor">角色</th><th>用户操作</th><th>系统响应</th></tr></thead>
         <tbody>
-          <tr v-for="s in v.steps" :key="s.no" class="step-row" :data-no="s.no" :class="{ system: isSystem(s), flash: flashNo === s.no }" :title="`左键单击弹出操作菜单，右键单击跳到流程原型步骤 ${s.no}`" @click="onRowClick($event, s)" @contextmenu.prevent="emit('focus-step', s.no)">
+          <tr v-for="s in visibleVariantSteps(v)" :key="s.no" class="step-row" :data-no="s.no" :class="{ system: isSystem(s), flash: flashNo === s.no }" :title="`左键单击弹出操作菜单，右键单击跳到流程原型步骤 ${s.no}`" @click="onRowClick($event, s)" @contextmenu.prevent="emit('focus-step', s.no)">
             <td class="no">{{ s.no }}</td>
             <td class="actor">{{ displayActor(s.actor) }}</td>
             <td>{{ isSystem(s) ? '' : s.action }}</td>
@@ -168,19 +295,19 @@ watch(() => actionMenu.value.show, (v) => {
           </tr>
         </tbody>
       </table>
-      <p v-else class="dim">（该小节为说明性内容，无步骤表）</p>
+      <p v-else class="dim">（该小节为说明性内容，无步骤表{{ roleName ? '，或该角色视角下无可见步骤' : '' }}）</p>
     </section>
 
-    <section v-if="scenario.data.ui_material?.length">
-      <h3>关键界面 / 交互（界面素材）</h3>
+    <section v-if="uiMaterial.length">
+      <h3>关键界面 / 交互（界面素材）{{ roleView?.ui_material?.length ? ` · ${roleName}` : '' }}</h3>
       <ul class="ui-material">
-        <li v-for="(t, i) in scenario.data.ui_material" :key="i" :style="{ paddingLeft: indentOf(t) + 'px' }">{{ t.replace(/^\s*[-*+]\s*/, '') }}</li>
+        <li v-for="(t, i) in uiMaterial" :key="i" :style="{ paddingLeft: indentOf(t) + 'px' }">{{ t.replace(/^\s*[-*+]\s*/, '') }}</li>
       </ul>
     </section>
 
-    <section v-if="scenario.data.acceptance?.length">
-      <h3>验收标准（{{ scenario.data.acceptance.length }}）</h3>
-      <ul class="accept"><li v-for="(t, i) in scenario.data.acceptance" :key="i">{{ t.replace(/^\[ \]\s*/, '') }}</li></ul>
+    <section v-if="acceptance.length">
+      <h3>验收标准（{{ acceptance.length }}）{{ roleView?.acceptance?.length ? ` · ${roleName}` : '' }}</h3>
+      <ul class="accept"><li v-for="(t, i) in acceptance" :key="i">{{ t.replace(/^\[ \]\s*/, '') }}</li></ul>
     </section>
 
     <section v-if="scenario.data.exceptions?.length">
@@ -216,7 +343,46 @@ watch(() => actionMenu.value.show, (v) => {
       <MermaidBlock :text="notesText" only="text" />
     </section>
 
-    <!-- 步骤行操作菜单 -->
+    <!-- 版本总结（AI 归纳该版本主要交付了什么）+ 变更历史 -->
+    <section v-if="scenario.version && (verSummary || verSummaryPending)" class="ver-summary">
+      <h3>📦 版本 {{ scenario.version }} 总结</h3>
+      <p v-if="verSummary" class="vs-text">{{ verSummary }}</p>
+      <p v-else class="dim">AI 正在生成该版本总结…</p>
+    </section>
+
+    <details v-if="changes.length" class="changelog">
+      <summary>🕘 变更历史（{{ changes.length }}）</summary>
+      <div class="chg-list">
+        <div v-for="c in changes" :key="c.id" class="chg-item">
+          <div class="chg-meta">
+            <span class="chg-time">{{ fmtTime(c.created_at) }}</span>
+            <span class="chg-origin">{{ originLabel(c.origin) }}</span>
+            <span v-if="c.version" class="chg-ver">{{ c.version }}</span>
+          </div>
+          <div class="chg-summary">{{ c.summary }}</div>
+          <div v-if="detailFields(c.detail).length" class="chg-detail dim">字段：{{ detailFields(c.detail).join('、') }}</div>
+        </div>
+      </div>
+    </details>
+
+    <!-- 实测记录：真实环境试用时记不一致点，可在工具开发页一键汇总反馈给开发 agent -->
+    <section class="findings">
+      <h3>🧪 实测记录 <span v-if="openFindingCount" class="fd-count">{{ openFindingCount }} 条待反馈</span></h3>
+      <div class="fd-input">
+        <input v-model="findingDraft" placeholder="真实环境试用时与预期不一致的点，记下来…（回车保存）"
+               :disabled="findingSaving" @keydown.enter="addFinding" />
+        <button class="fd-btn" :disabled="!findingDraft.trim() || findingSaving" @click="addFinding">记录</button>
+      </div>
+      <div v-if="findings.length" class="fd-list">
+        <div v-for="f in findings" :key="f.id" class="fd-item" :class="f.status">
+          <span class="fd-badge" :class="f.status">{{ f.status === 'open' ? '待反馈' : '已反馈' }}</span>
+          <span class="fd-text">{{ f.text }}</span>
+          <span class="fd-time dim">{{ fmtTime(f.created_at) }}</span>
+          <button class="fd-del" title="删除这条记录" @click="delFinding(f)">×</button>
+        </div>
+      </div>
+      <div class="dim fd-hint">「待反馈」的记录会在工具开发页点「发送给开发 agent 修正」时一并附上，之后自动转为「已反馈」。</div>
+    </section>
     <Teleport to="body">
       <div v-if="actionMenu.show" class="sv-action-menu" :style="{ left: actionMenu.x + 'px', top: actionMenu.y + 'px' }" @click.stop>
         <button class="sv-menu-item" @click="onAnnotate">✎ 批注</button>
@@ -264,6 +430,12 @@ watch(() => actionMenu.value.show, (v) => {
 section { margin-top: 18px; }
 h3 { font-size: 15px; margin: 0 0 8px; }
 table.steps { width: 100%; border-collapse: collapse; background: var(--panel); font-size: 13.5px; }
+.role-view-bar { background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; border-radius: 8px; padding: 8px 14px; font-size: 13px; margin-bottom: 14px; }
+/* 场景内角色视角切换 */
+.role-switch { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.role-opt { padding: 1px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel); font-size: 12.5px; cursor: pointer; user-select: none; }
+.role-opt:hover { border-color: var(--accent); color: var(--accent); }
+.role-opt.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 table.steps th, table.steps td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top; user-select: text; -webkit-user-select: text; white-space: pre-line; }
 table.steps th { background: var(--bg); font-weight: 600; }
 td.no, th.no { width: 48px; text-align: center; }
@@ -281,6 +453,38 @@ ul.accept li { margin-bottom: 4px; font-size: 13.5px; }
 ul.ui-material { list-style: none; padding: 0; }
 ul.ui-material li { font-size: 13.5px; margin-bottom: 3px; }
 .pending .kind { display: inline-block; font-size: 11px; border-radius: 4px; padding: 0 6px; margin-right: 8px; }
+/* 变更历史 */
+.ver-summary { border: 1px solid #ddd6fe; background: #f5f3ff; border-radius: 10px; padding: 12px 16px; margin-top: 14px; }
+.ver-summary h3 { margin: 0 0 6px; font-size: 13.5px; color: #6d28d9; }
+.vs-text { margin: 0; font-size: 13px; line-height: 1.7; }
+.changelog { border: 1px solid var(--border); border-radius: 10px; background: #fff; padding: 10px 14px; margin-top: 14px; }
+.changelog summary { font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
+.chg-list { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow-y: auto; }
+.chg-item { border-left: 2px solid var(--border); padding-left: 10px; }
+.chg-meta { display: flex; gap: 8px; align-items: baseline; font-size: 11.5px; color: var(--text-dim); }
+.chg-origin { background: var(--panel); border-radius: 3px; padding: 0 5px; }
+.chg-ver { background: #ede9fe; color: #7c3aed; border-radius: 3px; padding: 0 5px; }
+.chg-summary { font-size: 13px; margin-top: 1px; }
+.chg-detail { font-size: 11.5px; margin-top: 1px; }
+/* 实测记录 */
+.findings { border: 1px solid #bbf7d0; background: #f0fdf4; border-radius: 10px; padding: 12px 16px; }
+.findings h3 { margin: 0 0 8px; font-size: 13.5px; color: #15803d; }
+.fd-count { background: #22c55e; color: #fff; font-size: 11px; border-radius: 999px; padding: 1px 8px; margin-left: 6px; font-weight: 600; }
+.fd-input { display: flex; gap: 8px; }
+.fd-input input { flex: 1; border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; font-size: 13px; }
+.fd-btn { padding: 6px 14px; border: 1px solid #16a34a; background: #16a34a; color: #fff; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.fd-btn:disabled { opacity: .4; cursor: default; }
+.fd-list { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
+.fd-item { display: flex; align-items: baseline; gap: 8px; background: #fff; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+.fd-item.fed { opacity: .65; }
+.fd-badge { flex-shrink: 0; font-size: 11px; border-radius: 3px; padding: 0 6px; }
+.fd-badge.open { background: #fef3c7; color: #b45309; }
+.fd-badge.fed { background: #e5e7eb; color: var(--text-dim); }
+.fd-text { flex: 1; min-width: 0; white-space: pre-line; }
+.fd-time { flex-shrink: 0; font-size: 11.5px; }
+.fd-del { flex-shrink: 0; border: none; background: none; color: var(--text-dim); cursor: pointer; font-size: 14px; padding: 0 2px; }
+.fd-del:hover { color: #b91c1c; }
+.fd-hint { margin-top: 8px; font-size: 11.5px; }
 .pending.open .kind { background: var(--warn-soft); color: var(--warn); }
 .pending.done { color: var(--text-dim); }
 .pending.done .kind { background: #e5e7eb; color: var(--text-dim); }

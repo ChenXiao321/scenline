@@ -78,21 +78,21 @@ watch(() => props.scenario?.code, () => { activeFlowKey.value = flows.value[0]?.
 const activeFlow = computed(() => flows.value.find(f => f.key === activeFlowKey.value))
 
 // ---------------- 展开状态 ----------------
-const selectedNo = ref(null)   // 当前单展开的步骤号
+// 步骤号统一按字符串比较：变体号是 "3a"/"1b" 这类非数字，Number() 会得到 NaN 永远匹配不上
+const selectedNo = ref(null)   // 当前单展开的步骤号（字符串）
 const expandAll = ref(false)
 
 function toggleStep(no) {
   expandAll.value = false
-  const n = Number(no)
-  selectedNo.value = Number(selectedNo.value) === n ? null : n
+  const n = String(no)
+  selectedNo.value = selectedNo.value === n ? null : n
 }
 function toggleAll() {
   expandAll.value = !expandAll.value
   if (expandAll.value) selectedNo.value = null
 }
 function isOpen(no) {
-  // s.no 可能是字符串，selectedNo 存数字 —— 统一转数字比较
-  return expandAll.value || Number(selectedNo.value) === Number(no)
+  return expandAll.value || (selectedNo.value != null && String(selectedNo.value) === String(no))
 }
 
 // ---------------- 跨视图联动 ----------------
@@ -102,12 +102,15 @@ async function applyFocus() {
   const no = props.focus.step
   if (no == null) return
   expandAll.value = false
-  selectedNo.value = no
-  flashNo.value = no
+  selectedNo.value = String(no)
+  flashNo.value = String(no)
+  // 变体步骤（3a 等）在对应变体 tab 里，先切过去再展开
+  const flow = flows.value.find(f => (f.steps || []).some(s => String(s.no) === String(no)))
+  if (flow) activeFlowKey.value = flow.key
   await nextTick()
   await nextTick()   // 等卡片 v-if 渲染进 DOM
   document.querySelector(`.card[data-no="${no}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  setTimeout(() => { if (flashNo.value === no) flashNo.value = null }, 2200)
+  setTimeout(() => { if (flashNo.value === String(no)) flashNo.value = null }, 2200)
 }
 // seq 变化时消费 focus；immediate 兜底——组件因切视图重挂载时，挂载当拍也消费一次 pending focus
 watch(() => props.focus?.seq, () => applyFocus(), { immediate: true })
@@ -125,8 +128,8 @@ watch(() => [props.wsId, props.scenario?.code], loadUiSpec, { immediate: true })
 watch(() => props.reloadRev, (v, old) => { if (v && v !== old) loadUiSpec() })
 const step2screens = computed(() => stepToScreens(uiSpec.value))
 function screensOf(no) {
-  // s.no 可能是字符串 "1"，反查表 key 是数字 1 —— 统一转数字再查
-  return step2screens.value.get(Number(no)) || []
+  // 反查表 key 是字符串步骤号（支持 "3a" 这类变体号）
+  return step2screens.value.get(String(no)) || []
 }
 // 是否有任一步骤关联了工具屏（决定「打开工具原型」按钮显隐）
 const hasAnyLink = computed(() => {

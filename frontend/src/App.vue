@@ -22,39 +22,16 @@ function statusClass(s) {
   return { '草稿': 'st-draft', '已确认': 'st-confirmed', '已开发': 'st-developed', '已验证': 'st-verified' }[s] || 'st-draft'
 }
 
-// 场景状态/版本编辑
-const versionDraft = ref('')
+// 场景状态编辑（版本号由开发完成后的发版动作自动分配，不再手填）
 async function setStatus(s) {
   if (!scenario.value || scenario.value.status === s) return
-  // 约束：切到「已确认」必须有版本号（后端同样强制）
-  if (s === '已确认') {
-    if (!versionDraft.value.trim()) {
-      error.value = '切到「已确认」前请先填写版本号'
-      return
-    }
-    if (!confirm(`以版本 ${versionDraft.value.trim()} 确认该场景？确认后才能进入工具开发。`)) return
-  }
+  if (s === '已确认' && !confirm('确认该场景？确认后才能进入工具开发。')) return
   try {
-    const body = { status: s }
-    if (s === '已确认') body.version = versionDraft.value.trim()  // 一并写入，避免中间态无版本
     await api(`/api/workspaces/${ws.value.id}/scenarios/${encodeURIComponent(scenario.value.code)}/status`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: s }),
     })
     scenario.value.status = s
-    if (body.version != null) scenario.value.version = body.version
-    openWorkspace(ws.value.id)  // 场景树状态点同步
-  } catch (e) { error.value = e.message }
-}
-async function saveVersion() {
-  if (!scenario.value) return
-  const v = versionDraft.value.trim()
-  if (v === (scenario.value.version || '')) return
-  try {
-    await api(`/api/workspaces/${ws.value.id}/scenarios/${encodeURIComponent(scenario.value.code)}/status`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: '', version: v }),
-    })
-    scenario.value.version = v
-    openWorkspace(ws.value.id)
+    openWorkspace(ws.value.id, false)  // 场景树状态点同步，保留当前视图
   } catch (e) { error.value = e.message }
 }
 
@@ -83,7 +60,7 @@ function onAiApplied(change) {
   if (change?.action === 'update_ui_spec') uiSpecRev.value += 1  // 通知工具原型重拉规格
   if (change?.action === 'update_global_notes') globalNotesRev.value += 1  // 通知全局约定页/开发面板重拉
   const code = scenario.value?.code
-  openWorkspace(ws.value.id).then(async () => {
+  openWorkspace(ws.value.id, false).then(async () => {
     if (!code) return
     try {
       scenario.value = await api(`/api/workspaces/${ws.value.id}/scenarios/${encodeURIComponent(code)}`)
@@ -203,16 +180,19 @@ async function saveSysLabel() {
   } catch (e) { error.value = e.message }
 }
 
-async function openWorkspace(id) {
+async function openWorkspace(id, reset = true) {
+  // reset=false：只刷新工作域数据（场景树状态点等），保留当前主视图/选中场景（用于操作后原地刷新）
   loading.value = true
   error.value = ''
   try {
     ws.value = await api(`/api/workspaces/${id}`)
     setSysLabel(ws.value.settings)
     sysLabelDraft.value = ws.value.settings?.system_label || ''
-    scenario.value = null
-    devView.value = false
-    gnView.value = false
+    if (reset) {
+      scenario.value = null
+      devView.value = false
+      gnView.value = false
+    }
   } catch (e) { error.value = e.message }
   loading.value = false
 }
@@ -221,7 +201,6 @@ async function openScenario(code) {
   error.value = ''
   try {
     scenario.value = await api(`/api/workspaces/${ws.value.id}/scenarios/${encodeURIComponent(code)}`)
-    versionDraft.value = scenario.value.version || ''
     scenarioRoleName.value = ''  // 换场景重置视角
     mode.value = 'browse'
     editMode.value = null
@@ -234,7 +213,7 @@ async function openScenario(code) {
 
 async function onScenarioSaved(code) {
   editMode.value = null
-  await openWorkspace(ws.value.id)
+  await openWorkspace(ws.value.id, false)
   await openScenario(code)
 }
 
@@ -248,7 +227,7 @@ async function reimport() {
   loading.value = true
   try {
     await api(`/api/workspaces/${ws.value.id}/reimport`, { method: 'POST' })
-    await openWorkspace(ws.value.id)
+    await openWorkspace(ws.value.id, false)
   } catch (e) { error.value = e.message }
   loading.value = false
 }
@@ -457,9 +436,7 @@ onMounted(loadWorkspaces)
                   @click="setStatus(s)"
                 >{{ s }}</button>
               </div>
-              <span class="version-field" :title="scenario.status === '草稿' ? '该场景归属的工具发布版本（如 v0.1.0），失焦保存。切到「已确认」时必填' : '该场景归属的工具发布版本（如 v0.1.0），失焦保存'">
-                <input v-model="versionDraft" :placeholder="scenario.status === '草稿' ? '版本（确认时必填）' : '版本'" @blur="saveVersion" @keydown.enter="$event.target.blur()" />
-              </span>
+              <span v-if="scenario.version" class="version-tag" :title="`该场景归属的工具发布版本（发版时自动分配）`">{{ scenario.version }}</span>
             </div>
           </div>
           <div class="head-actions">
@@ -544,8 +521,7 @@ onMounted(loadWorkspaces)
 .status-btn.st-confirmed.active { background: #dbeafe; color: #1d4ed8; }
 .status-btn.st-developed.active { background: #f3e8ff; color: #7c3aed; }
 .status-btn.st-verified.active { background: #d1fae5; color: #047857; }
-.version-field input { width: 90px; border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; }
-.version-field input::placeholder { color: var(--text-dim); }
+.version-tag { font-size: 12px; color: var(--accent); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; }
 .head-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .btn { padding: 6px 14px; border: 1px solid var(--border); background: var(--panel); border-radius: 6px; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }

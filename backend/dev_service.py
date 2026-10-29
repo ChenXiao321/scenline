@@ -71,7 +71,7 @@ ui_spec 是用户在原型工具里逐屏确认过的设计，你的实现必须
 - 输出该标记后停止，等用户回复。除此之外不要中途停下问问题，能自主决定的直接做。
 
 现在开始。先简述你的开发计划（形态选型 + 文件结构），然后动手实现。
-"""
+**收尾时**（本轮全部完成、准备结束前）必须输出一段交付说明，包含：①本次实现了哪些功能（按场景逐条）；②交付物形态与版本（如 package.json 里的 version）；③如何安装/打包/运行验证（关键命令）；④未完成项与偏差。这段会直接展示给用户作为验收依据。"""
 
 CONTINUE_TEMPLATE = """用户回复了你提出的问题：
 
@@ -135,6 +135,7 @@ class DevTask:
         self.summary = ""             # done 时的收尾说明
         self.error = ""
         self.codes: list[str] = []
+        self.version: str = ""        # 本轮发版分配的版本号（mark-developed 时由 main 回填）
         self.log_lines: list[str] = []  # 展示用日志（assistant 文本增量 + 状态行）
         self.started_at = 0.0
         self.finished_at = 0.0
@@ -142,6 +143,7 @@ class DevTask:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._last_prompt: str = ""   # 最近一次发出的 prompt，error 后 resume 时重发
+        self._queue: queue.Queue = queue.Queue()   # 对话消息队列：running 时发的消息排队，当前轮结束后自动接下一条
 
     # ---------------------------------------------------------- 进程
     def _spawn(self) -> None:
@@ -162,8 +164,13 @@ class DevTask:
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
 
-    def _send(self, text: str) -> None:
-        msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+    def _send(self, text: str, image: str = "") -> None:
+        content: list[dict] = []
+        if image:
+            b64 = image.split(",", 1)[-1]
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+        content.append({"type": "text", "text": text or "（看图）"})
+        msg = {"type": "user", "message": {"role": "user", "content": content}}
         self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
         self.proc.stdin.flush()
 
@@ -182,9 +189,9 @@ class DevTask:
             pass
 
     # ---------------------------------------------------------- 主循环
-    def _pump(self, prompt: str) -> None:
+    def _pump(self, prompt: str, image: str = "") -> None:
         """发一条 user 消息并消费事件流直到 result；按内容更新状态。返回是否还能继续。"""
-        self._send(prompt)
+        self._send(prompt, image)
         texts: list[str] = []
         while True:
             ev = _read_event(self.proc)
@@ -223,10 +230,20 @@ class DevTask:
             self.status = "waiting_input"
             self.question = m.group(1).strip()
             self._log(f"\n【待确认】{self.question}")
-        else:
-            self.status = "done"
-            self.summary = reply[-800:]
-            self._log("\n【完成】本轮开发结束")
+            return True
+        # 本轮结束：队列里还有消息就直接接下一条（保持 running），否则 done
+        try:
+            nxt = self._queue.get_nowait()
+        except queue.Empty:
+            nxt = None
+        if nxt is not None:
+            ntext, nimage = nxt
+            self._log(f"\n【你（排队消息）】{ntext}{' [图片]' if nimage else ''}")
+            self._append_dev_log(f"\n**[用户排队消息 {time.strftime('%H:%M:%S')}]** {ntext}")
+            return self._pump(ntext, nimage)
+        self.status = "done"
+        self.summary = reply[-800:]
+        self._log("\n【完成】本轮开发结束")
         self.finished_at = time.time()
         return True
 
@@ -276,9 +293,9 @@ class DevTask:
         self._thread = threading.Thread(target=self._run, args=(resume_prompt,), daemon=True)
         self._thread.start()
 
-    def feedback(self, text: str) -> None:
+    def feedback(self, text: str, image: str = "") -> None:
         """done/error 后用户反馈修正：新起一轮进程，把反馈作为增量需求发给 agent。
-        反馈修正不改场景状态（由用户在平台上决定要不要回退重确认）。"""
+        反馈修正不改场景状态（由用户在平台上决定要不要回退重确认）。可附带截图。"""
         if self.status in ("running", "waiting_input"):
             raise RuntimeError("开发进行中，请先回复待确认问题或等其结束")
         if not self.codes:
@@ -288,10 +305,21 @@ class DevTask:
         self.error = ""
         self.question = ""
         self.finished_at = 0.0
-        self._log(f"\n【用户反馈】{text}")
+        self._log(f"\n【用户反馈】{text}{' [图片]' if image else ''}")
         self._append_dev_log(f"\n# 反馈修正 {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n用户反馈：\n{text}")
-        self._thread = threading.Thread(target=self._run, args=(prompt,), daemon=True)
+        self._thread = threading.Thread(target=self._run_fb, args=(prompt, image), daemon=True)
         self._thread.start()
+
+    def _run_fb(self, prompt: str, image: str = "") -> None:
+        """feedback 专用：新起进程发首轮（带图）。"""
+        try:
+            self._spawn()
+            self._pump(prompt, image)
+        except Exception as e:
+            self.status = "error"
+            self.error = str(e)[:500]
+            self._log(f"【错误】{self.error}")
+            self.finished_at = time.time()
 
     def answer(self, text: str) -> None:
         """waiting_input 状态下把用户回复发回同一进程继续。"""
@@ -304,9 +332,43 @@ class DevTask:
         self._thread = threading.Thread(target=self._continue, args=(prompt,), daemon=True)
         self._thread.start()
 
-    def _continue(self, prompt: str) -> None:
+    def chat(self, text: str, image: str = "") -> str:
+        """持续对话（消息排队式，像普通聊天）：
+        - 进程活着且 running：消息入队，当前轮结束后自动接下一条；
+        - 进程活着且 waiting_input：直接发进进程（agent 本就在等输入）；
+        - 进程活着且 done/error：直接发进现有会话进程；
+        - 进程已退出：由调用方走反馈修正通道（新起进程）。
+        返回去向：queued | live。"""
+        if not self.proc or self.proc.poll() is not None:
+            raise RuntimeError("进程已退出")
+        tag = f"{text}{' [图片]' if image else ''}"
+        if self.status == "running":
+            self._queue.put((text, image))
+            self._log(f"\n【你（已排队）】{tag}")
+            return "queued"
+        if self.status == "waiting_input":
+            # agent 在等输入：直接答（等同于回复待确认问题）
+            self.status = "running"
+            self._log(f"\n【你】{tag}")
+            self._append_dev_log(f"\n**[用户对话 {time.strftime('%H:%M:%S')}]** {text}")
+            prompt = CONTINUE_TEMPLATE.format(reply=text)
+            self._thread = threading.Thread(target=self._continue, args=(prompt, image), daemon=True)
+            self._thread.start()
+            return "live"
+        if self.status in ("done", "error"):
+            self.status = "running"
+            self.question = ""
+            self.error = ""
+            self._log(f"\n【你】{tag}")
+            self._append_dev_log(f"\n**[用户对话 {time.strftime('%H:%M:%S')}]** {text}")
+            self._thread = threading.Thread(target=self._continue, args=(text, image), daemon=True)
+            self._thread.start()
+            return "live"
+        raise RuntimeError("当前状态不能对话")
+
+    def _continue(self, prompt: str, image: str = "") -> None:
         try:
-            self._pump(prompt)
+            self._pump(prompt, image)
         except Exception as e:
             self.status = "error"
             self.error = str(e)[:500]
@@ -324,6 +386,7 @@ class DevTask:
         return {
             "status": self.status,
             "codes": self.codes,
+            "version": self.version,
             "question": self.question,
             "summary": self.summary,
             "error": self.error,
@@ -332,7 +395,32 @@ class DevTask:
             "work_dir": str(self.work_dir),
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "queued": self._queue.qsize(),
+            "deliverable_hint": self._deliverable_hint(),
         }
+
+    def _deliverable_hint(self) -> str:
+        """从 README 抽「安装/运行/发布」段给 done 面板展示；抽不到给通用提示。"""
+        try:
+            readme = (self.work_dir / "README.md").read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+        lines = readme.splitlines()
+        start = -1
+        for i, l in enumerate(lines):
+            if re.match(r"^#{1,3}\s*.*(安装|运行|发布|打包|快速开始|getting started|install|usage)", l, re.IGNORECASE):
+                start = i
+                break
+        if start < 0:
+            return ""
+        out = []
+        for l in lines[start:]:
+            if out and re.match(r"^#{1,3}\s", l) and not re.match(r"^#{1,3}\s*.*(安装|运行|发布|打包|调试|测试)", l, re.IGNORECASE):
+                break
+            out.append(l)
+            if len(out) > 60:
+                break
+        return "\n".join(out).strip()
 
 
 class DevManager:
@@ -378,4 +466,11 @@ class DevManager:
         if not task:
             raise RuntimeError("没有可反馈的开发任务（先点「开始开发」）")
         task.feedback(text)
+        return task
+
+    def chat(self, ws_id: int, text: str) -> DevTask:
+        task = self._tasks.get(ws_id)
+        if not task:
+            raise RuntimeError("没有开发任务（先点「开始开发」）")
+        task.chat(text)
         return task

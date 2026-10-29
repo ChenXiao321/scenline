@@ -10,6 +10,7 @@ import json
 import logging
 import sys
 import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -289,10 +290,12 @@ def update_scenario(ws_id: int, code: str, req: ScenarioSaveRequest):
         raise HTTPException(400, "场景标题不能为空")
     proj.update_scenario(code, req.title.strip(), req.domain.strip(), req.data, req.pending)
     # 变更历史：手工编辑（平台总结字段差异）
+    # 版本快照口径同 AI 应用：已确认（在开发）的修改归该版本；已开发/已验证/草稿的修改属下一版本（记空，发版时回填）
     changed = _diff_scenario_fields(old, req)
     if changed:
+        ver_snap = old.get("version", "") if old.get("status") == "已确认" else ""
         proj.log_scenario_change(code, "手工编辑：" + "、".join(changed),
-                                 json.dumps(changed, ensure_ascii=False), old.get("version", ""), "manual_edit")
+                                 json.dumps(changed, ensure_ascii=False), ver_snap, "manual_edit")
     return {"saved": True}
 
 
@@ -330,6 +333,27 @@ class FindingRequest(BaseModel):
     text: str
 
 
+class ToolFeedbackRequest(BaseModel):
+    text: str
+    scenario_code: str = ""   # 可选：用户选关联场景；空串=工具级
+
+
+@app.post("/api/workspaces/{ws_id}/feedback")
+def add_tool_feedback(ws_id: int, req: ToolFeedbackRequest):
+    """工具侧（GLink 扩展）随手记反馈：scenario_code 可选，空串=工具级（不挂具体场景）。
+    统一落 finding 表，平台「实测记录」区/开发页「反馈修正」都能看到并汇总给 agent。"""
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    if not req.text.strip():
+        raise HTTPException(400, "内容不能为空")
+    proj = store.project(ws_id)
+    code = req.scenario_code.strip()
+    if code and not proj.get_scenario(code):
+        raise HTTPException(400, f"场景 {code} 不存在（可不填表示工具级反馈）")
+    fid = proj.add_finding(code, req.text.strip())
+    return {"id": fid, "scenario_code": code}
+
+
 @app.get("/api/workspaces/{ws_id}/scenarios/{code}/findings")
 def list_findings(ws_id: int, code: str):
     if not store.get_workspace(ws_id):
@@ -357,14 +381,21 @@ def delete_finding(ws_id: int, finding_id: int):
     return {"deleted": True}
 
 
+@app.get("/api/workspaces/{ws_id}/findings")
+def list_all_findings(ws_id: int):
+    """项目级实测记录总览（开发页展示待反馈条目用），含工具级（scenario_code 空串）。"""
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    return {"findings": store.project(ws_id).open_findings()}
+
+
 class ScenarioStatusRequest(BaseModel):
     status: str = ""
-    version: str | None = None   # None=不动版本；""=清空版本
 
 
 @app.put("/api/workspaces/{ws_id}/scenarios/{code}/status")
 def set_scenario_status(ws_id: int, code: str, req: ScenarioStatusRequest):
-    """设置场景状态/版本。status 为空串则只动版本。切到「已确认」必须有版本号。"""
+    """设置场景状态。版本号不再手填：由开发完成后的发版动作统一分配（v1/v2… 自动递增）。"""
     if not store.get_workspace(ws_id):
         raise HTTPException(404, "工作域不存在")
     proj = store.project(ws_id)
@@ -375,39 +406,35 @@ def set_scenario_status(ws_id: int, code: str, req: ScenarioStatusRequest):
     status = req.status.strip()
     if status and status not in SCENARIO_STATUSES:
         raise HTTPException(400, f"非法状态：{status}（可选：{'/'.join(SCENARIO_STATUSES)}）")
-    # 约束：切到「已确认」时，生效后的版本号不能为空
-    if status == "已确认":
-        effective = req.version if req.version is not None else sc["version"]
-        if not (effective or "").strip():
-            raise HTTPException(400, "切到「已确认」必须先填版本号（该场景归属的工具发布版本）")
-    proj.set_scenario_status(code, status or None, req.version)
-    # 确认成功后：后台异步（重新）生成该版本的 AI 总结——新版本首个确认/已有版本新增确认场景都会刷新
-    if status == "已确认":
-        ver = (req.version if req.version is not None else sc["version"]).strip()
-        threading.Thread(target=_gen_version_summary, args=(ws_id, ver), daemon=True).start()
+    if not status:
+        return {"saved": True}
+    proj.set_scenario_status(code, status)
     return {"saved": True}
 
 
 def _gen_version_summary(ws_id: int, version: str) -> None:
-    """后台任务：汇总该版本下所有场景的变更历史，让 AI 生成一句话版本总结（release notes 风格）。"""
+    """后台任务：汇总该版本下场景在本版本内的变更记录（严格按版本过滤，不含历史版本内容），AI 生成 release notes 风格总结。"""
     try:
         proj = store.project(ws_id)
         codes = proj.list_scenarios_by_version(version)
         if not codes:
             return
+        desc = proj.get_version_desc(version)
         lines = []
         for c in codes:
             sc = proj.get_scenario(c)
             if not sc:
                 continue
             lines.append(f"## 场景 {c}：{sc['title']}")
-            for ch in proj.list_scenario_changes(c, limit=50):
+            for ch in proj.list_scenario_changes(c, limit=50, version=version):
                 if ch["summary"]:
                     lines.append(f"- {ch['summary']}")
         prompt = (
-            f"你是工具发布经理。下面是工具版本 {version} 包含的场景及其变更明细。"
+            f"你是工具发布经理。下面是工具版本 {version} 包含的场景及其在本版本内的变更明细。"
             "请写一段 3-6 句的版本总结（release notes 风格）：这个版本主要交付了什么能力、覆盖哪些场景、有什么重要行为变化。"
+            "只归纳本版本的增量内容，不要展开场景既有功能的完整描述。"
             "用中文，面向阅读变更记录的人，不要逐条复述，要归纳。直接输出总结正文，不要标题和前缀。\n\n"
+            + (f"【发布者对本版本的描述】{desc}\n\n" if desc else "")
             + "\n".join(lines)
         )
         text, _ = ai.chat([{"role": "user", "content": prompt}])
@@ -420,10 +447,11 @@ def _gen_version_summary(ws_id: int, version: str) -> None:
 
 @app.get("/api/workspaces/{ws_id}/version-summary")
 def get_version_summary(ws_id: int, version: str):
-    """某工具版本的 AI 总结（可能为空：后台还没生成完）。"""
+    """某工具版本的 AI 总结 + 发布者手填描述（可能为空：后台还没生成完/未填）。"""
     if not store.get_workspace(ws_id):
         raise HTTPException(404, "工作域不存在")
-    return {"version": version, "summary": store.project(ws_id).get_version_summary(version)}
+    proj = store.project(ws_id)
+    return {"version": version, "summary": proj.get_version_summary(version), "desc": proj.get_version_desc(version)}
 
 
 @app.delete("/api/workspaces/{ws_id}/scenarios/{code}")
@@ -812,21 +840,25 @@ def ai_apply(req: AiApplyRequest):
         pending = patch["pending"] if "pending" in patch else sc["pending"]
         proj.update_scenario(code, title, domain, data, pending)
         # 变更历史：AI 的 summary 即变更总结，detail 记录动了哪些字段
+        # 版本快照口径：已确认（在开发）的修改归该版本；已开发/已验证/草稿的修改属下一版本（记空，发版时回填）
+        ver_snap = sc.get("version", "") if sc.get("status") == "已确认" else ""
         proj.log_scenario_change(
             code, c.get("summary", "AI 修改场景"),
             json.dumps({"fields": sorted(patch.keys())}, ensure_ascii=False),
-            sc.get("version", ""), "ai_apply",
+            ver_snap, "ai_apply",
         )
     elif action == "update_process_spec":
         if not isinstance(c.get("spec"), dict):
             raise HTTPException(400, "缺少 spec")
         proj.save_process_spec(code, c["spec"])
-        proj.log_scenario_change(code, c.get("summary", "AI 更新过程拆解"), "", sc.get("version", ""), "ai_apply")
+        ver_snap = sc.get("version", "") if sc.get("status") == "已确认" else ""
+        proj.log_scenario_change(code, c.get("summary", "AI 更新过程拆解"), "", ver_snap, "ai_apply")
     elif action == "update_ui_spec":
         if not isinstance(c.get("spec"), dict):
             raise HTTPException(400, "缺少 spec")
         proj.save_ui_spec(code, c["spec"])
-        proj.log_scenario_change(code, c.get("summary", "AI 更新工具原型"), "", sc.get("version", ""), "ai_apply")
+        ver_snap = sc.get("version", "") if sc.get("status") == "已确认" else ""
+        proj.log_scenario_change(code, c.get("summary", "AI 更新工具原型"), "", ver_snap, "ai_apply")
     else:
         raise HTTPException(400, f"未知 action：{action}")
     return {"applied": True, "action": action, "code": code}
@@ -888,12 +920,12 @@ def _existing_block(work_dir: Path) -> str:
 
 
 class DevelopRequest(BaseModel):
-    codes: list[str]           # 本次要实现的场景号
-    version: str = ""          # 本次开发归属的工具发布版本（成功后标到场景上）
+    codes: list[str]           # 本次要实现的场景号（版本号不再手填，发版时自动分配）
 
 
 class DevInputRequest(BaseModel):
     text: str                  # 用户对 [NEEDS_INPUT] 问题的回复
+    image: str = ""            # 可选：base64 截图（dataURL 或裸 base64）
 
 
 @app.get("/api/workspaces/{ws_id}/develop/target")
@@ -968,31 +1000,67 @@ def develop_start(ws_id: int, req: DevelopRequest):
     )
     try:
         task = dev.start(ws_id, label, req.codes, prompt, cli, cfg.get("model", ""))
-        task.version = req.version.strip()  # 开发成功后标到场景上
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     return {"started": True, "work_dir": str(work_dir), "status": task.status}
 
 
+class MarkDevelopedRequest(BaseModel):
+    desc: str = ""             # 本版本描述（可选，展示用+作为 AI 总结的输入）
+
+
 @app.post("/api/workspaces/{ws_id}/develop/mark-developed")
-def develop_mark(ws_id: int):
-    """开发任务完成后由前端调用：把本次场景标为「已开发」并记录版本。幂等。"""
+def develop_mark(ws_id: int, req: MarkDevelopedRequest):
+    """发版：开发任务完成后由前端调用。幂等——每轮任务只发一版（反馈修正沿用同一版本，不升版）。
+
+    动作：分配自动递增版本号 v<N> → 场景标「已开发」并归属该版本 → 回填这批场景无版本的
+    变更记录（草稿/确认期修改）→ 后台生成版本总结。已「已开发」的重复开发（修正）不升版。
+    """
     task = dev.get(ws_id)
     if not task or task.status != "done":
         return {"marked": False, "reason": "无已完成任务"}
     proj = store.project(ws_id)
-    ver = getattr(task, "version", "")
-    proj.mark_scenarios_developed(task.codes, ver)
-    for code in task.codes:
-        proj.log_scenario_change(code, f"工具开发完成，标记「已开发」{('（版本 ' + ver + '）') if ver else ''}",
-                                 "", ver, "develop_mark")
-    return {"marked": True, "codes": task.codes, "version": ver}
+    codes = task.codes
+    # 已发过版的场景（已开发/已验证且有版本）：沿用原版本；其余场景触发新版本
+    unreleased = [c for c in codes
+                  if not ((sc := proj.get_scenario(c)) and sc["status"] in ("已开发", "已验证") and sc["version"])]
+    ver = ""
+    if unreleased:
+        ver = proj.next_version()
+        proj.mark_scenarios_developed(codes, ver)
+        proj.assign_changes_version(codes, ver)
+        if req.desc.strip():
+            proj.save_version_desc(ver, req.desc.strip())
+        for code in codes:
+            proj.log_scenario_change(code, f"工具开发完成，标记「已开发」（版本 {ver}）", "", ver, "develop_mark")
+        threading.Thread(target=_gen_version_summary, args=(ws_id, ver), daemon=True).start()
+    else:
+        proj.mark_scenarios_developed(codes, "")
+        for code in codes:
+            sc = proj.get_scenario(code)
+            v0 = sc.get("version", "") if sc else ""
+            proj.log_scenario_change(code, "工具修正开发完成，保持「已开发」", "", v0, "develop_mark")
+    # 版本号落到任务快照，done 面板直接展示
+    task.version = ver or (proj.get_scenario(codes[0]).get("version", "") if codes else "")
+    # 任务元信息落库：平台重启后开发页能恢复"上次开发过"的状态（持续对话入口可用）
+    proj.save_dev_meta(codes, task.version, task.finished_at or time.time())
+    return {"marked": True, "codes": codes, "version": task.version}
 
 
 @app.get("/api/workspaces/{ws_id}/develop/status")
 def develop_status(ws_id: int):
     task = dev.get(ws_id)
     if not task:
+        # 内存中没有任务（平台重启过/从没开发过）：从库里的 dev_meta 恢复"上次开发过"的完成态，
+        # 让持续对话/反馈修正入口可用（发消息时会新起会话进程）
+        if store.get_workspace(ws_id):
+            meta = store.project(ws_id).get_dev_meta()
+            if meta and meta.get("codes"):
+                return {"status": "done", "log_tail": [], "files": [], "question": "", "summary": "",
+                        "error": "", "started_at": 0, "finished_at": meta.get("finished_at", 0),
+                        "codes": meta["codes"], "version": meta.get("version", ""),
+                        "work_dir": str(dev.tool_dir(ws_id, _system_label(store.get_workspace(ws_id)))),
+                        "deliverable_hint": ""}
         return {"status": "idle", "log_tail": [], "files": [], "codes": []}
     return task.snapshot()
 
@@ -1007,6 +1075,46 @@ def develop_input(ws_id: int, req: DevInputRequest):
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     return {"continued": True, "status": task.status}
+
+
+@app.post("/api/workspaces/{ws_id}/develop/chat")
+def develop_chat(ws_id: int, req: DevInputRequest):
+    """done/error 后持续对话。会话进程活着：原样发进现有进程（上下文最全）；
+    进程已退出（平台重启过）：自动降级为反馈修正通道——新起进程，agent 读 .dev-log.md 恢复上下文。"""
+    if not store.get_workspace(ws_id):
+        raise HTTPException(404, "工作域不存在")
+    if not req.text.strip() and not req.image:
+        raise HTTPException(400, "消息不能为空")
+    task = dev.get(ws_id)
+    if not task:
+        # 平台重启后内存无任务：从 dev_meta 恢复场景列表，重建任务对象，走反馈修正通道新起会话
+        proj = store.project(ws_id)
+        meta = proj.get_dev_meta()
+        if not meta or not meta.get("codes"):
+            raise HTTPException(404, "没有开发任务（先点「开始开发」）")
+        cli = ai._claude_cli_path()
+        if not cli:
+            raise HTTPException(400, "未找到 claude CLI（对话依赖本机 claude）")
+        import dev_service
+        cfg = ai.load_config()
+        t = dev_service.DevTask(ws_id, dev.tool_dir(ws_id, _system_label(store.get_workspace(ws_id))),
+                                cli, cfg.get("model", ""))
+        t.codes = meta["codes"]
+        t.version = meta.get("version", "")
+        dev._tasks[ws_id] = t
+        task = t
+    alive = task.proc is not None and task.proc.poll() is None
+    try:
+        if alive:
+            via = task.chat(req.text.strip(), req.image)   # running→排队；waiting_input/done/error→直接发
+        elif task.status in ("done", "error", "idle"):
+            task.feedback(req.text.strip(), req.image)     # 进程已退出：新起会话（读 .dev-log.md 续上下文）
+            via = "respawn"
+        else:
+            raise RuntimeError("开发进行中但进程异常，请刷新后重试")
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {"sent": True, "via": via, "status": task.status}
 
 
 @app.post("/api/workspaces/{ws_id}/develop/resume")
@@ -1041,7 +1149,8 @@ def develop_feedback(ws_id: int, req: DevFeedbackRequest):
         if opens:
             lines = ["", "【真实环境实测记录的不一致点】"]
             for f in opens:
-                lines.append(f"- 场景 {f['scenario_code']}：{f['text']}")
+                tag = f"场景 {f['scenario_code']}" if f["scenario_code"] else "工具级（扩展内记录）"
+                lines.append(f"- {tag}：{f['text']}")
                 fed_ids.append(f["id"])
             parts.append("\n".join(lines))
     if not parts:

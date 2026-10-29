@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -315,13 +316,68 @@ class ProjectStore:
             c.execute(f"UPDATE scenario SET {', '.join(sets)} WHERE code = ?", vals)
 
     def mark_scenarios_developed(self, codes: list[str], version: str = "") -> None:
-        """开发工具成功后：把场景标为「已开发」，可选记录所属工具版本。"""
+        """开发工具成功后：把场景标为「已开发」，记录所属工具版本。"""
         with self._conn() as c:
             for code in codes:
                 if version:
                     c.execute("UPDATE scenario SET status = '已开发', version = ? WHERE code = ?", (version, code))
                 else:
                     c.execute("UPDATE scenario SET status = '已开发' WHERE code = ?", (code,))
+
+    # ---------------------------------------------------------- 发布版本（v1/v2… 自动递增，开发完成时分配）
+    def next_version(self) -> str:
+        """分配下一个发布版本号并推进计数器。首次发版按库里最大旧版本号初始化（如旧版到 1.1 → 下一个为 v2）。"""
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM project_kv WHERE key = 'next_version'").fetchone()
+            if row:
+                n = int(row["value"])
+            else:
+                n = 1
+                for r in c.execute("SELECT DISTINCT version FROM scenario WHERE version != ''").fetchall():
+                    for num in re.findall(r"\d+", r["version"]):
+                        n = max(n, int(num) + 1)
+            c.execute(
+                "INSERT INTO project_kv(key, value) VALUES ('next_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(n + 1),),
+            )
+        return f"v{n}"
+
+    def assign_changes_version(self, codes: list[str], version: str) -> int:
+        """发版回填：把指定场景下无版本归属的变更记录（草稿期/确认期修改）归入该版本。返回回填条数。"""
+        with self._conn() as c:
+            cur = c.execute(
+                f"UPDATE scenario_change_log SET version = ? WHERE version = '' "
+                f"AND scenario_code IN ({','.join('?' * len(codes))})",
+                (version, *codes),
+            )
+            return cur.rowcount
+
+    def get_version_desc(self, version: str) -> str:
+        """用户手填的本版本描述（发布时可选）。"""
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM project_kv WHERE key = ?", (f"version_desc:{version}",)).fetchone()
+        return row["value"] if row else ""
+
+    def save_version_desc(self, version: str, text: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO project_kv(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (f"version_desc:{version}", text),
+            )
+
+    def peek_next_version(self) -> str:
+        """预览下一个版本号（不推进计数器），给开发页展示用。"""
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM project_kv WHERE key = 'next_version'").fetchone()
+            if row:
+                return f"v{row['value']}"
+            n = 1
+            for r in c.execute("SELECT DISTINCT version FROM scenario WHERE version != ''").fetchall():
+                for num in re.findall(r"\d+", r["version"]):
+                    n = max(n, int(num) + 1)
+        return f"v{n}"
 
     def create_scenario(self, code: str, title: str, domain: str, data: dict, pending: list) -> None:
         with self._conn() as c:
@@ -484,14 +540,18 @@ class ProjectStore:
                 (code, summary, detail, version, origin, time.time()),
             )
 
-    def list_scenario_changes(self, code: str, limit: int = 100) -> list[dict]:
-        """某场景的变更历史，倒序（最新在前）。"""
+    def list_scenario_changes(self, code: str, limit: int = 100, version: str = None) -> list[dict]:
+        """某场景的变更历史，倒序（最新在前）。version 非 None 时只取该版本归属的记录。"""
+        sql = ("SELECT id, summary, detail, version, origin, created_at FROM scenario_change_log "
+               "WHERE scenario_code = ?")
+        vals: list = [code]
+        if version is not None:
+            sql += " AND version = ?"
+            vals.append(version)
+        sql += " ORDER BY id DESC LIMIT ?"
+        vals.append(limit)
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT id, summary, detail, version, origin, created_at FROM scenario_change_log "
-                "WHERE scenario_code = ? ORDER BY id DESC LIMIT ?",
-                (code, limit),
-            ).fetchall()
+            rows = c.execute(sql, vals).fetchall()
         return [dict(r) for r in rows]
 
     def scenario_version_of(self, code: str) -> str:
@@ -520,6 +580,25 @@ class ProjectStore:
         with self._conn() as c:
             rows = c.execute("SELECT code FROM scenario WHERE version = ? ORDER BY CAST(code AS REAL), code", (version,)).fetchall()
         return [r["code"] for r in rows]
+
+    # ---------------------------------------------------------- 开发任务元信息（持久化，重启后可恢复"上次开发过"）
+    def save_dev_meta(self, codes: list[str], version: str = "", finished_at: float = 0.0) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO project_kv(key, value) VALUES ('dev_meta', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps({"codes": codes, "version": version, "finished_at": finished_at}, ensure_ascii=False),),
+            )
+
+    def get_dev_meta(self) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM project_kv WHERE key = 'dev_meta'").fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["value"])
+        except Exception:
+            return None
 
     # ---------------------------------------------------------- 实测记录
     def add_finding(self, code: str, text: str) -> int:

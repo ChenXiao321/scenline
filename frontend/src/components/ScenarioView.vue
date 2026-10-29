@@ -59,20 +59,24 @@ async function loadChanges() {
 }
 watch(() => [props.wsId, props.scenario?.code], loadChanges, { immediate: true })
 
-// 版本总结：场景确认到某版本时后台 AI 生成；未生成完会显示"生成中"并稍后重试拉一次
+// 版本总结：发版（开发完成）时后台 AI 生成；未生成完会显示"生成中"并稍后重试拉一次
 const verSummary = ref('')
+const verDesc = ref('')          // 发布者手填的本版本描述
 const verSummaryPending = ref(false)
 let vsTimer = null
 async function loadVersionSummary() {
   clearTimeout(vsTimer)
   verSummary.value = ''
+  verDesc.value = ''
   verSummaryPending.value = false
   const v = props.scenario?.version
   if (!props.wsId || !v) return
   try {
     const res = await fetch(`/api/workspaces/${props.wsId}/version-summary?version=${encodeURIComponent(v)}`)
     if (!res.ok) return
-    const s = ((await res.json()).summary || '').trim()
+    const r = await res.json()
+    verDesc.value = (r.desc || '').trim()
+    const s = (r.summary || '').trim()
     if (s) verSummary.value = s
     else {
       // 还没生成完：5 秒后再拉一次
@@ -343,11 +347,12 @@ watch(() => actionMenu.value.show, (v) => {
       <MermaidBlock :text="notesText" only="text" />
     </section>
 
-    <!-- 版本总结（AI 归纳该版本主要交付了什么）+ 变更历史 -->
-    <section v-if="scenario.version && (verSummary || verSummaryPending)" class="ver-summary">
+    <!-- 版本总结（发布者描述 + AI 归纳该版本主要交付了什么）+ 变更历史 -->
+    <section v-if="scenario.version && (verSummary || verDesc || verSummaryPending)" class="ver-summary">
       <h3>📦 版本 {{ scenario.version }} 总结</h3>
+      <p v-if="verDesc" class="vs-desc">发布者描述：{{ verDesc }}</p>
       <p v-if="verSummary" class="vs-text">{{ verSummary }}</p>
-      <p v-else class="dim">AI 正在生成该版本总结…</p>
+      <p v-else-if="verSummaryPending" class="dim">AI 正在生成该版本总结…</p>
     </section>
 
     <details v-if="changes.length" class="changelog">
@@ -457,6 +462,7 @@ ul.ui-material li { font-size: 13.5px; margin-bottom: 3px; }
 .ver-summary { border: 1px solid #ddd6fe; background: #f5f3ff; border-radius: 10px; padding: 12px 16px; margin-top: 14px; }
 .ver-summary h3 { margin: 0 0 6px; font-size: 13.5px; color: #6d28d9; }
 .vs-text { margin: 0; font-size: 13px; line-height: 1.7; }
+.vs-desc { margin: 0 0 6px; font-size: 12.5px; color: #6d28d9; }
 .changelog { border: 1px solid var(--border); border-radius: 10px; background: #fff; padding: 10px 14px; margin-top: 14px; }
 .changelog summary { font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
 .chg-list { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow-y: auto; }
